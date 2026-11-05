@@ -13,33 +13,40 @@ from __future__ import annotations
 __lazy_modules__ = [
     "json", "re", "shutil", "tempfile", "time", "urllib.parse",
     "questionary",
-    "rich.markup", "rich.panel", "rich.progress",
+    "rich.markup", "rich.panel", "rich.progress", "rich.table",
 ]
 
+import calendar
 import functools
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import questionary
 from rich.console import Console
 from rich.markup import escape
+from rich.console import Group
 from rich.panel import Panel
+from rich.table import Column, Table
 from rich.progress import (
-    BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn,
+    BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn,
 )
 
 console = Console()
 
-CONFIG_FILE = Path(__file__).with_name("compressor_config.json")
-DEFAULT_OUTPUT_FOLDER = Path(__file__).with_name("compressed_output")
+CONFIG_FILE = Path(__file__).with_name("config.json")
+LEGACY_CONFIG_FILE = Path(__file__).with_name("compressor_config.json")   # read once if config.json is missing
+DEFAULT_OUTPUT_FOLDER = Path(__file__).with_name("output")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FORMATS - each one only appears for inputs it can actually be made from
@@ -58,6 +65,29 @@ FORMATS = [
 ]
 
 COMPRESSION_LEVELS = ["fastest", "fast", "normal", "maximum"]
+
+# frame rate choices: "original" keeps the source, "auto" lets ratecap decide, otherwise an exact rate
+FPS_CHOICES = [
+    ("Keep original", "original"),
+    ("Adaptive (ratecap picks based on the target size)", "auto"),
+    ("60 fps", Fraction(60)),
+    ("59.94 fps (NTSC)", Fraction(60000, 1001)),
+    ("50 fps (PAL)", Fraction(50)),
+    ("30 fps", Fraction(30)),
+    ("29.97 fps (NTSC)", Fraction(30000, 1001)),
+    ("25 fps (PAL)", Fraction(25)),
+    ("24 fps (film)", Fraction(24)),
+    ("23.976 fps (NTSC film)", Fraction(24000, 1001)),
+]
+ADAPTIVE_MIN_SCALE = 0.7     # adaptive fps drops frames before letting resolution fall below 70%
+ADAPTIVE_MIN_FPS = 24
+
+# bulk folder scan (.ts is left out on purpose, it matches TypeScript files)
+VIDEO_EXTS = {".mts", ".m2ts", ".m2t", ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".mpg", ".mpeg",
+              ".wmv", ".webm", ".3gp", ".flv", ".mxf"}
+# what an MP4 can hold without re-encoding
+MP4_VIDEO_OK = {"h264", "hevc", "av1", "mpeg4", "vp9"}
+MP4_AUDIO_COPY = {"aac", "ac3", "eac3", "mp3", "alac"}
 
 # name -> (video codec, audio codec, family)
 VIDEO_CODECS = {
@@ -118,12 +148,14 @@ def unique_path(folder: Path, stem: str, ext: str) -> Path:
 
 
 def load_config() -> dict:
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    for path in (CONFIG_FILE, LEGACY_CONFIG_FILE):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def save_config(data: dict) -> None:
@@ -208,42 +240,246 @@ def get_duration(info: dict) -> float:
     return d
 
 
-def get_fps(v: dict) -> float:
+def get_fps(v: dict) -> Fraction:
+    """Exact source frame rate (e.g. 30000/1001), 30 if ffprobe gives nothing sane."""
     for key in ("avg_frame_rate", "r_frame_rate"):
         try:
             n, d = str(v.get(key, "0/1")).split("/")
-            fps = float(n) / float(d)
-            if fps > 0:
-                return min(fps, 120.0)
+            fps = Fraction(int(n), int(d))
+            if 0 < fps <= 240:
+                return fps.limit_denominator(100000)
         except (ValueError, ZeroDivisionError):
             pass
-    return 30.0
+    return Fraction(30)
+
+
+def pick_fps(src: Fraction, mode, video_kbps: float, w: int, h: int, family: str) -> tuple:
+    """Output frame rate for the chosen mode, plus a short note (may be empty)."""
+    if mode in (None, "original"):
+        return src, ""
+    if mode == "auto":
+        def scale_at(f):                # resolution factor the bitrate allows at frame rate f
+            return math.sqrt(video_kbps * 1000 / (w * h * float(f) * MIN_BPP[family]))
+        # only clean divisions (60 -> 30, 50 -> 25, 59.94 -> 29.97) so motion stays even
+        ladder = [src / k for k in (1, 2, 4) if k == 1 or src / k >= ADAPTIVE_MIN_FPS]
+        pick = ladder[-1]
+        for f in ladder:
+            if scale_at(f) >= ADAPTIVE_MIN_SCALE:
+                pick = f
+                break
+        if pick == src:
+            return src, ""
+        return pick, f"{float(src):g} -> {float(pick):g} fps"
+    if mode > src * Fraction(101, 100):
+        return src, f"kept {float(src):g} fps (source is lower)"
+    return mode, ""
+
+
+def collect_videos(folder: Path, skip: Path) -> list:
+    """All video files under `folder` (AVCHD card copies included), natural sort, ignoring our output folder."""
+    skip, root = skip.resolve(), folder.resolve()
+    # ratecap's own results are only ignored when scanning a folder that CONTAINS the output folder,
+    # a folder inside it (for example output/youtube/My Mix) is a normal input
+    ignore_output = skip != root and skip not in root.parents
+    found = []
+    for p in folder.rglob("*"):
+        if p.suffix.lower() in VIDEO_EXTS and p.is_file() and not any(part.startswith(".tmp_") for part in p.parts):
+            if not (ignore_output and skip in p.resolve().parents):
+                found.append(p)
+    return sorted(found, key=lambda p: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(p))])
+
+
+def is_interlaced(path: Path, v: dict) -> bool:
+    """Camcorder footage (AVCHD .MTS) is usually interlaced, which looks combed if re-encoded as is."""
+    fo = v.get("field_order", "unknown")
+    if fo in ("tt", "bb", "tb", "bt"):
+        return True
+    if fo == "progressive":
+        return False
+    try:    # ffprobe doesn't always know for transport streams, so look at the first frames
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "info", "-i", str(path), "-map", "0:v:0",
+                            "-vf", "idet", "-frames:v", "150", "-an", "-f", "null", NULL_DEVICE],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # ffmpeg prints the idet stats twice (an empty warm-up block first), the last one is the real result
+    found = re.findall(r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)", r.stderr)
+    if not found:
+        return False
+    tff, bff, prog = map(int, found[-1])
+    return tff + bff > 3 * prog         # clearly interlaced, not just a few ambiguous frames
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FFmpeg RUNNER (live progress, real error messages)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CONSOLE LOOK: themed prompts, section headers, aligned key/value lines, per-file progress
+# ──────────────────────────────────────────────────────────────────────────────
+
+_QSTYLE = None
+
+
+def _style():
+    global _QSTYLE
+    if _QSTYLE is None:
+        _QSTYLE = questionary.Style([
+            ("qmark", "fg:#00d7ff bold"), ("question", "bold"), ("answer", "fg:#00d7ff bold"),
+            ("pointer", "fg:#00d7ff bold"), ("highlighted", "fg:#00d7ff bold"), ("selected", "fg:#5fd75f"),
+            ("separator", "fg:#6c6c6c"), ("instruction", "fg:#808080"), ("text", ""),
+            ("disabled", "fg:#858585 italic"),
+        ])
+    return _QSTYLE
+
+
+def qselect(*a, **k):
+    k.setdefault("style", _style())
+    k.setdefault("pointer", ">")
+    return questionary.select(*a, **k)
+
+
+def qcheckbox(*a, **k):
+    k.setdefault("style", _style())
+    k.setdefault("pointer", ">")
+    return questionary.checkbox(*a, **k)
+
+
+def qtext(*a, **k):
+    k.setdefault("style", _style())
+    return questionary.text(*a, **k)
+
+
+def qconfirm(*a, **k):
+    k.setdefault("style", _style())
+    return questionary.confirm(*a, **k)
+
+
+def qpath(*a, **k):
+    k.setdefault("style", _style())
+    return questionary.path(*a, **k)
+
+
+def split_paths(raw: str) -> list:
+    """Dragging several files into the window pastes them as one line: "a.mp4" "b.mp4" ... Split that into paths."""
+    raw = raw.strip()
+    one = raw.strip("\"'")
+    if not raw or Path(one).expanduser().exists() or parse_link(one):
+        return [one]
+    parts = [a or b for a, b in re.findall(r'"([^"]+)"|(\S+)', raw)]
+    if len(parts) > 1 and any(Path(x).expanduser().exists() for x in parts):
+        return parts
+    return [one]
+
+
+def section(title: str) -> None:
+    console.print()
+    console.rule(f"[bold cyan]{title}[/]", style="dim cyan", align="left")
+
+
+def kv(label: str, value: str) -> None:
+    console.print(f"  [dim]{label:<12}[/] {value}")
+
+
+def fmt_secs(sec: float) -> str:
+    sec = int(round(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+def fmt_bytes(n: float) -> str:
+    return f"{n / 1_073_741_824:.2f} GiB" if n >= 1_073_741_824 else f"{n / 1_048_576:.2f} MiB"
+
+
 class UI:
-    def __init__(self, progress: Progress):
-        self.p = progress
-        self.t = progress.add_task("Starting", total=100)
+    """Live bars for the file being processed (and the whole batch). Finished files stay printed above them."""
+
+    def __init__(self, progress: Progress, total: int = 1):
+        self.p, self.total = progress, total
+        self.done_n = 0
+        self.overall = progress.add_task("", total=total) if total > 1 else None
+        self.cur = progress.add_task("", total=100)
+        self.name, self.prefix, self.tags, self._seen = "", "", [], set()
+        self._refresh()
+
+    def _refresh(self, frac: float = 0.0) -> None:
+        if self.overall is not None:
+            self.p.update(self.overall, completed=min(self.total, self.done_n + frac),
+                          description=f"[bold]Overall[/]  {self.done_n}/{self.total} files")
+
+    def begin(self, i: int, name: str) -> None:
+        self.name = escape(name if len(name) <= 46 else name[:43] + "...")
+        self.prefix = f"{i}/{self.total}  " if self.total > 1 else ""
+        self.tags = []
+        self.stage("starting")
 
     def stage(self, text: str) -> None:
-        self.p.update(self.t, description=text, completed=0)
+        self.p.update(self.cur, description=f"{self.prefix}{self.name}  [dim]{text}[/]", completed=0)
 
     def tick(self, frac: float) -> None:
-        self.p.update(self.t, completed=max(0.0, min(1.0, frac)) * 100)
+        frac = max(0.0, min(1.0, frac))
+        self.p.update(self.cur, completed=frac * 100)
+        self._refresh(frac)
 
     def note(self, text: str) -> None:
         self.p.console.print(text)
 
+    def once(self, key: str, text: str) -> None:
+        if key not in self._seen:
+            self._seen.add(key)
+            self.p.console.print(text)
 
-def run_ffmpeg(args: list, ui: UI | None = None, duration: float | None = None) -> None:
+    def tag(self, text: str) -> None:
+        if text and text not in self.tags:
+            self.tags.append(text)
+
+    def _num(self, i: int) -> str:
+        return f"[dim]{i:>{len(str(self.total))}}/{self.total}[/]" if self.total > 1 else ""
+
+    def done(self, i: int, name: str, dst: Path | None, secs: float, src_size: int | None = None) -> None:
+        size = f"  {fmt_bytes(dst.stat().st_size):>10}" if dst and dst.exists() else ""
+        if size and src_size:
+            size = f"  [dim]{fmt_bytes(src_size):>10} \u2192[/]{size[1:]}"
+        tags = f"  [dim]({', '.join(self.tags)})[/]" if self.tags else ""
+        lead = f"{self._num(i)}  " if self.total > 1 else ""
+        self.p.console.print(f"[green]\u2713[/] {lead}{escape(name)}  [green]done in {fmt_secs(secs)}[/]{size}{tags}")
+        self.done_n += 1
+        self._refresh()
+
+    def fail(self, i: int, name: str, reason: str, secs: float) -> None:
+        first = reason.strip().splitlines()[-1] if reason.strip() else "failed"
+        lead = f"{self._num(i)}  " if self.total > 1 else ""
+        self.p.console.print(f"[red]\u2717[/] {lead}{escape(name)}  [red]failed after {fmt_secs(secs)}[/]\n"
+                             f"      {escape(first[:200])}")
+        self.done_n += 1
+        self._refresh()
+
+
+def choose_items(labels: list, noun: str) -> list:
+    """For bulk jobs: process everything or pick specific items. Returns the chosen indexes in order."""
+    n = len(labels)
+    if n < 2:
+        return list(range(n))
+    mode = ask(qselect(f"Process all {n} {noun}, or choose specific ones?", choices=[
+        questionary.Choice(f"All {n} {noun}", "all"),
+        questionary.Choice("Choose specific ones", "pick"),
+    ]))
+    if mode == "all":
+        return list(range(n))
+    while True:
+        picked = ask(qcheckbox("Select with Space, a = toggle all, i = invert, Enter = confirm",
+                               choices=[questionary.Choice(lbl, i) for i, lbl in enumerate(labels)]))
+        if picked:
+            return sorted(picked)
+        console.print("[yellow]Nothing selected, pick at least one[/yellow]")
+
+
+def run_ffmpeg(args: list, ui: UI | None = None, duration: float | None = None, cwd=None) -> None:
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
            "-nostats", "-progress", "pipe:1", *map(str, args)]
     with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err,
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, cwd=cwd,
                                 text=True, encoding="utf-8", errors="replace")
         try:
             for line in proc.stdout:
@@ -280,8 +516,11 @@ def video_enc_args(family: str, vcodec: str, level: str, kbps: int) -> list:
 
 
 def compress_video(inp: Path, dst_dir: Path, stem: str, target_mib: int, level: str, fmt: dict,
-                   info: dict, saturation: float, use_2pass: bool, use_gpu: bool, ui: UI) -> Path:
+                   info: dict, saturation: float, use_2pass: bool, use_gpu: bool, fps_mode, ui: UI,
+                   burn: dict | None = None) -> Path:
     v = video_stream(info)
+    if v is None:
+        raise RuntimeError("No video stream in this file")
     has_audio = audio_stream(info) is not None
     duration = get_duration(info)
     target_bytes = int(target_mib * 1_048_576)
@@ -302,24 +541,42 @@ def compress_video(inp: Path, dst_dir: Path, stem: str, target_mib: int, level: 
 
     # ── resolution: shrink only as far as needed to keep enough bits per pixel ──
     w, h = _int(v.get("width"), 1920), _int(v.get("height"), 1080)
-    fps = get_fps(v)
-    factor = math.sqrt(video_kbps * 1000 / (w * h * fps * MIN_BPP[family]))
+    sar_filter = None
+    if burn:                    # anamorphic clips (for example 1440x1080) need square pixels for the text to look right
+        f = sar_factor(v)
+        if f != 1.0:
+            w = max(2, round(w * f / 2) * 2)
+            sar_filter = f"scale={w}:{h},setsar=1"
+    src_fps = get_fps(v)
+    out_fps, fps_note = pick_fps(src_fps, fps_mode, video_kbps, w, h, family)
+    if fps_note:
+        ui.tag(fps_note)
+    factor = math.sqrt(video_kbps * 1000 / (w * h * min(float(out_fps), 120.0) * MIN_BPP[family]))
     factor = min(1.0, max(factor, min(1.0, 240 / min(w, h))))     # never below 240p short side, never upscale
     new_w, new_h = max(2, int(w * factor) // 2 * 2), max(2, int(h * factor) // 2 * 2)
 
-    vf = []
-    if (new_w, new_h) != (w, h):
-        vf.append(f"scale={new_w}:{new_h}:flags=lanczos")
+    pre, post = [], []
+    if is_interlaced(inp, v):
+        pre.append("bwdif=mode=send_frame:parity=auto:deint=interlaced")
+        ui.tag("deinterlaced")
+    if sar_filter:
+        pre.append(sar_filter)
     if saturation != 100:
-        vf.append(f"eq=saturation={saturation / 100:.2f}")
-    vf_args = ["-vf", ",".join(vf)] if vf else []
-
-    src = ["-i", str(inp), "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"]
+        pre.append(f"eq=saturation={saturation / 100:.2f}")
+    if out_fps != src_fps:
+        post.append(f"fps={out_fps.numerator}/{out_fps.denominator}")
+    if (new_w, new_h) != (w, h):
+        post.append(f"scale={new_w}:{new_h}:flags=lanczos")
+    vf_args = []
+    # the date is burned in at full resolution, then scaled together with the picture
+    src = ["-i", str(inp), *video_graph_args(pre, burn, post, w, h), "-map", "0:a:0?", "-dn"]
     audio_args = ["-c:a", acodec, "-b:a", f"{audio_kbps}k", "-ac", "2"] if has_audio else []
     mux_args = ["-movflags", "+faststart"] if fmt["ext"] == ".mp4" else []
 
     with tempfile.TemporaryDirectory(dir=dst_dir, prefix=".tmp_compress_") as td:
         td = Path(td)
+        if burn:
+            shutil.copy(burn["font"], td / "font.ttf")
         log = str(td / "pass")
         stats_ready = False
         best = smallest = None            # (size, path)
@@ -335,25 +592,23 @@ def compress_video(inp: Path, dst_dir: Path, stem: str, target_mib: int, level: 
                 try:
                     run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps),
                                 "-pass", "1", "-passlogfile", log, "-an", "-f", "null", NULL_DEVICE],
-                               ui, duration)
+                               ui, duration, cwd=td)
                     stats_ready = True
                 except FFmpegError:
-                    ui.note("[yellow]2-pass not supported by this encoder/build → using single pass[/yellow]")
+                    ui.once("no2pass", "[yellow]2-pass is not supported by this encoder/build, using single pass[/yellow]")
                     two_pass = False
 
             if two_pass:
                 ui.stage(f"{tag} · pass 2/2 · {kbps} kbps")
                 run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps),
                             "-pass", "2", "-passlogfile", log, *audio_args, *mux_args, out_try],
-                           ui, duration)
+                           ui, duration, cwd=td)
             else:
                 ui.stage(f"{tag} · {kbps} kbps")
                 run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps),
-                            *audio_args, *mux_args, out_try], ui, duration)
+                            *audio_args, *mux_args, out_try], ui, duration, cwd=td)
 
             size = out_try.stat().st_size
-            ui.note(f"[dim]  {tag}: {kbps} kbps -> {size / 1_048_576:.2f} MiB "
-                    f"({size / target_bytes:.0%} of target)[/dim]")
             if smallest is None or size < smallest[0]:
                 smallest = (size, out_try)
             if size <= target_bytes and (best is None or size > best[0]):
@@ -366,13 +621,19 @@ def compress_video(inp: Path, dst_dir: Path, stem: str, target_mib: int, level: 
             kbps = int(kbps * (target_bytes * 0.975 - audio_bytes) / video_bytes)
             if kbps < 30:
                 break
+            ui.note(f"[dim]  {ui.name}: {tag}: {size / 1_048_576:.2f} MiB ({size / target_bytes:.0%} of target), "
+                    f"trying again at {kbps} kbps[/dim]")
 
         chosen = best or smallest
+        ui.tag(f"{chosen[0] / target_bytes:.0%} of target")
         if best is None:
             ui.note(f"[yellow]Could not get under {target_mib} MiB "
                     f"(best: {chosen[0] / 1_048_576:.2f} MiB) - try a bigger target or lower resolution[/yellow]")
         dst = unique_path(dst_dir, stem, fmt["ext"])
         os.replace(chosen[1], dst)
+        if burn:
+            st = inp.stat()
+            os.utime(dst, (st.st_atime, st.st_mtime))      # keep the recording time as the file date
         return dst
 
 
@@ -492,6 +753,484 @@ def compress_image(inp: Path, dst_dir: Path, stem: str, target_mib: int, level: 
             scale *= max(0.3, min(0.9, math.sqrt(target_bytes / smallest) * 0.95))   # nothing fit → shrink
 
         raise RuntimeError(f"Could not get the image under {target_mib} MiB")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOSSLESS CONVERT (no re-encoding)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def stream_hash(path: Path, kind: str, index: int, tmp: Path, ui: UI, duration: float) -> str:
+    """MD5 of the fully decoded video/audio stream, independent of container, timestamps and packet layout."""
+    out = tmp / f"hash_{kind}{index}.txt"
+    if kind == "v":
+        args = ["-i", str(path), "-map", f"0:v:{index}", "-an", "-sn", "-dn",
+                "-c:v", "rawvideo", "-fps_mode", "passthrough"]
+    else:
+        args = ["-i", str(path), "-map", f"0:a:{index}", "-vn", "-sn", "-dn",
+                "-af", "aformat=sample_fmts=s32", "-c:a", "pcm_s32le"]
+    run_ffmpeg([*args, "-f", "hash", "-hash", "md5", out], ui, duration)
+    return out.read_text().strip()
+
+
+def convert_lossless(inp: Path, dst_dir: Path, stem: str, info: dict, container: str,
+                     audio_mode: str, verify: bool, ui: UI) -> Path:
+    """Re-wrap video and audio into a new container. Video is never re-encoded."""
+    v = video_stream(info)
+    if v is None:
+        raise RuntimeError("No video stream in this file")
+    audios = [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+    acodecs = [a.get("codec_name", "") for a in audios]
+    vcodec = v.get("codec_name", "")
+    duration = get_duration(info)
+
+    if container == "mp4" and vcodec not in MP4_VIDEO_OK:
+        ui.note(f"[yellow]  {escape(vcodec or 'This video codec')} can't go into MP4 cleanly, using MKV for this file[/yellow]")
+        container = "mkv"
+    a_args, lossy_audio, bad = plan_audio(acodecs, container, audio_mode)
+    if bad:
+        ui.note(f"[yellow]  {escape(bad)} audio can't go into MP4 losslessly, using MKV for this file[/yellow]")
+        container = "mkv"
+        a_args, lossy_audio, _ = plan_audio(acodecs, container, audio_mode)
+    ext = ".mp4" if container == "mp4" else ".mkv"
+
+    subs = [s for s in info.get("streams", []) if s.get("codec_type") == "subtitle"]
+    sub_args = ["-map", "0:s?", "-c:s", "copy"] if container == "mkv" and subs else []
+    if subs and container == "mp4":
+        ui.once("pgs", "[dim]Note: the camera's on-screen date track can't go into MP4, use the date burn-in option to keep the date visible[/dim]")
+
+    st = inp.stat()
+    extra = creation_meta(info, st)     # AVCHD files carry no date in the container, keep the recording time
+    if container == "mp4" and vcodec == "hevc":
+        extra += ["-tag:v", "hvc1"]
+
+    with tempfile.TemporaryDirectory(dir=dst_dir, prefix=".tmp_convert_") as td:
+        td = Path(td)
+        out_try = td / f"out{ext}"
+        ui.stage(f"Converting to {ext[1:].upper()}")
+        run_ffmpeg(["-i", str(inp), "-map", "0:v:0", "-map", "0:a?", *sub_args, "-dn",
+                    "-c:v", "copy", *a_args, *extra, out_try], ui, duration)
+
+        if verify:
+            ui.stage("Verifying video")
+            if stream_hash(inp, "v", 0, td, ui, duration) != stream_hash(out_try, "v", 0, td, ui, duration):
+                raise RuntimeError("Verification failed: the converted video differs from the original (original is untouched)")
+            if not lossy_audio:
+                for i in range(len(audios)):
+                    ui.stage(f"Verifying audio {i + 1}/{len(audios)}")
+                    if stream_hash(inp, "a", i, td, ui, duration) != stream_hash(out_try, "a", i, td, ui, duration):
+                        raise RuntimeError(f"Verification failed: audio track {i + 1} differs from the original (original is untouched)")
+            ui.tag("verified identical" if not lossy_audio else "video verified, audio converted by choice")
+
+        dst = unique_path(dst_dir, stem, ext)
+        os.replace(out_try, dst)
+    os.utime(dst, (st.st_atime, st.st_mtime))       # keep the file's date
+    return dst
+
+
+def ask_convert_options(config: dict) -> dict:
+    container = ask(qselect("Convert to", choices=[
+        questionary.Choice("MP4  -  plays almost everywhere", "mp4"),
+        questionary.Choice("MKV  -  keeps every stream exactly as recorded", "mkv"),
+    ], default=config.get("convert_container", "mp4")))
+    audio = "keep"
+    if container == "mp4":
+        audio = ask(qselect("Audio", choices=[
+            questionary.Choice("Keep original audio (lossless)", "keep"),
+            questionary.Choice("Convert to AAC 256 kbps (plays on more devices, tiny quality change)", "aac"),
+        ], default=config.get("convert_audio", "keep")))
+    verify = ask(qconfirm("Verify each file is identical to the original? (decodes both, slower)",
+                                     default=bool(config.get("verify", True))))
+    config.update({"convert_container": container, "convert_audio": audio, "verify": verify})
+    save_config(config)
+    return {"container": container, "audio": audio, "verify": verify}
+
+
+def convert_one(path: Path, dest: Path, c: dict, info: dict, ui: UI) -> Path:
+    return convert_lossless(path, dest, path.stem, info, c["container"], c["audio"], c["verify"], ui)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AVCHD DATE/TIME BURN-IN
+# ──────────────────────────────────────────────────────────────────────────────
+# A Sony Handycam stores the recording time twice inside every .MTS clip:
+#   1. as a picture-subtitle track (the exact "Data Code" graphic the camera shows)
+#   2. as MDPM metadata in the H.264 stream (a real date and time every ~0.5 s)
+# The CPI/MPL files next to the clip are not needed for the date.
+
+MTS_EXTS = {".mts", ".m2ts"}
+MDPM_UUID = bytes.fromhex("17ee8c60f84d11d98cd60800200c9a66")
+# Handycam on-screen Data Code, measured from a capture of the camera's own playback (fractions of the frame):
+# two right-aligned lines (date over time), medium-weight white digits with a thin black outline, no background box.
+# The camera spaces its characters differently from a normal font, so each group (day, month, year, hours,
+# minutes, seconds) is placed on its own at the position measured from that capture.
+DC_SIZE = 0.0702        # font size / frame height (Arial Regular digits are 0.716 of this)
+DC_RIGHT = 0.917        # right edge of the digits / frame width
+DC_DATE_TOP = 0.7009    # top of the date digits / frame height
+DC_TIME_TOP = 0.7824    # top of the time digits / frame height
+DC_BEARING = 0.05       # a glyph's right side bearing in font sizes (turns an ink edge into a text origin)
+DC_DASH_DROP = 0.0298   # a lone hyphen is placed by its own top edge, so it is dropped to where the camera draws it
+# right ink edge of each group, as a fraction of the frame height, counted left from the right edge of the text
+DC_X_DATE = {"year": 0.0, "dash2": -0.1616, "month": -0.1871, "dash1": -0.2700, "day": -0.2962}
+DC_X_TIME = {"sec": 0.0, "min": -0.0928, "hour": -0.1885}
+
+BURN_QUALITY = [("High quality (looks identical to the original, recommended)", 18),
+                ("Very high quality (bigger files)", 14),
+                ("Lossless (huge files, some players can't open them)", 0)]
+BURN_SPEEDS = [("Fast", "veryfast"), ("Balanced", "medium"), ("Slow (smaller file)", "slow")]
+
+
+def find_avchd_stream(path: Path) -> Path | None:
+    """The STREAM folder of an AVCHD recording (a card or a copy of it), or None."""
+    cands = [path / rel for rel in ("PRIVATE/AVCHD/BDMV/STREAM", "AVCHD/BDMV/STREAM", "BDMV/STREAM", "STREAM")]
+    if path.name.upper() == "STREAM":
+        cands.append(path)
+    for d in cands:
+        try:
+            if d.is_dir() and any(p.suffix.lower() in MTS_EXTS for p in d.iterdir()):
+                return d
+        except OSError:
+            pass
+    return None
+
+
+def _bcd(b: int) -> int:
+    return (b >> 4) * 10 + (b & 15)
+
+
+def parse_mdpm(data: bytes):
+    """Decode Sony's MDPM block (what follows the SEI UUID). Returns (datetime, camera model) or None."""
+    if data[:4] != b"MDPM":
+        return None
+    tags = {}
+    for k in range(data[4]):
+        e = data[5 + 5 * k: 10 + 5 * k]
+        if len(e) < 5:
+            break
+        tags[e[0]] = e[1:]
+    t18, t19 = tags.get(0x18), tags.get(0x19)      # 0x18 = zone/year/month, 0x19 = day/hour/minute/second (BCD)
+    if not t18 or not t19:
+        return None
+    try:
+        dt = datetime(_bcd(t18[1]) * 100 + _bcd(t18[2]), _bcd(t18[3]), _bcd(t19[0]),
+                      _bcd(t19[1]), _bcd(t19[2]), _bcd(t19[3]))
+    except ValueError:
+        return None
+    model = b"".join(tags.get(t, b"") for t in (0xE4, 0xE5, 0xE6)).rstrip(b"\0").decode("ascii", "replace")
+    return dt, model
+
+
+def _ts_payloads(f, pid: int):
+    """Payload of every transport stream packet for one PID (handles 188 and 192 byte packets)."""
+    head = f.read(400)
+    f.seek(0)
+    size = 192 if head[4:5] == b"G" and head[196:197] == b"G" else 188
+    skip = size - 188
+    while True:
+        chunk = f.read(size * 2048)
+        if not chunk:
+            return
+        for i in range(0, len(chunk) - size + 1, size):
+            p = chunk[i + skip:i + size]
+            if p[0] != 0x47 or (((p[1] & 0x1F) << 8) | p[2]) != pid:
+                continue
+            afc = (p[3] >> 4) & 3
+            if not afc & 1:
+                continue
+            yield bool(p[1] & 0x40), p[(5 + p[4]) if afc & 2 else 4:]
+
+
+def _pes_pts(b: bytes) -> int:
+    return (((b[0] >> 1) & 7) << 30) | (b[1] << 22) | ((b[2] >> 1) << 15) | (b[3] << 7) | (b[4] >> 1)
+
+
+def read_mdpm(path: Path, pid: int, start_time: float, max_hits: int = 12) -> tuple:
+    """First few MDPM stamps as ([(seconds from the start of the file, datetime)], camera model)."""
+    samples, model = [], None
+    buf, pts = bytearray(), None
+
+    def flush():
+        nonlocal model
+        if pts is None or not buf:
+            return
+        i = buf.find(MDPM_UUID)
+        if i >= 0:
+            r = parse_mdpm(bytes(buf[i + 16:i + 16 + 200]))
+            if r:
+                samples.append((pts / 90000 - start_time, r[0]))
+                model = model or r[1]
+
+    with open(path, "rb") as f:
+        for pusi, payload in _ts_payloads(f, pid):
+            if pusi:
+                flush()
+                buf.clear()
+                pts = None
+                if payload[:3] != b"\x00\x00\x01" or len(payload) < 15:
+                    continue
+                if payload[7] & 0x80:
+                    pts = _pes_pts(payload[9:14])
+                payload = payload[9 + payload[8]:]
+            if len(buf) < 1024:             # the stamp sits in the first bytes of each picture
+                buf += payload
+            if len(samples) >= max_hits:
+                break
+        else:
+            flush()
+    return samples, model
+
+
+def inspect_clip(path: Path, info: dict) -> dict:
+    """The recording date of a clip, read from the Sony MDPM stamps inside its video stream."""
+    out = {"first": None, "offset": None, "model": None,
+           "duration": _float(info.get("format", {}).get("duration"), 0.0)}
+    v = video_stream(info)
+    try:
+        pid = int(str(v.get("id")), 0) if v else None
+    except ValueError:
+        pid = None
+    if not pid or "mpegts" not in info.get("format", {}).get("format_name", ""):
+        return out
+    try:
+        samples, out["model"] = read_mdpm(path, pid, _float(info["format"].get("start_time"), 0.0))
+    except OSError:
+        return out
+    if samples:
+        out["first"] = samples[0][1]
+        # each stamp says "the clock showed S during this frame", so the clock's phase must fit all of them
+        pairs = [(p, calendar.timegm(dt.timetuple())) for p, dt in samples]
+        lo = max(s - p for p, s in pairs)
+        hi = min(s + 1 - p for p, s in pairs)
+        out["offset"] = (lo + hi) / 2 if lo < hi else lo
+    return out
+
+
+def find_font() -> Path | None:
+    if os.name == "nt":
+        base = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+        names = ["arial.ttf", "segoeui.ttf", "tahoma.ttf", "verdana.ttf", "arialbd.ttf"]
+        bases = [base]
+    else:
+        names = ["LiberationSans-Regular.ttf", "Arial.ttf", "Arial Unicode.ttf", "DejaVuSans.ttf", "Helvetica.ttc"]
+        bases = [Path(p) for p in ("/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/TTF",
+                                   "/usr/share/fonts/truetype/liberation", "/Library/Fonts",
+                                   "/System/Library/Fonts/Supplemental", "/System/Library/Fonts")]
+    for n in names:             # the preferred font wins, whichever folder it is in
+        for b in bases:
+            if (b / n).is_file():
+                return b / n
+    return None
+
+
+def date_segments(offset: float, duration: float) -> list:
+    """The calendar date for each stretch of the clip, split where midnight passes: [(from s, to s or None, date)]."""
+    t, out = 0.0, []
+    while True:
+        wall = datetime.fromtimestamp(offset + t, timezone.utc)
+        midnight = (wall.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).timestamp() - offset
+        if midnight > duration + 1:
+            out.append((t, None, wall))
+            return out
+        out.append((t, midnight, wall))
+        t = midnight
+
+
+def datecode_filters(burn: dict, w: int, h: int) -> list:
+    """Draw the Handycam Data Code: date over time, right aligned, white digits with a thin black outline.
+    The drawtext filters read font.ttf from ffmpeg's working folder."""
+    size = max(12, round(h * DC_SIZE))
+    emb = max(0, round(h / 1080))       # a white border of this width thickens the regular font to the camera's weight
+    outl = max(2, round(h / 720))       # width of the black outline (thin, like the camera)
+
+    def piece(text: str, x_off: float, top: float, extra: str = "") -> tuple:
+        x = f"x='w*{DC_RIGHT}+{x_off * h + DC_BEARING * size:.2f}-text_w'"
+        base = f"drawtext=fontfile=font.ttf:fontsize={size}:text='{text}':{x}:y='h*{top}'{extra}"
+        if emb:
+            return (f"{base}:fontcolor=black:borderw={emb + outl}:bordercolor=black",
+                    f"{base}:fontcolor=white:borderw={emb}:bordercolor=white")
+        return (None, f"{base}:fontcolor=white:borderw={outl}:bordercolor=black")
+
+    def lay(pieces: list) -> list:      # all outlines first, so a neighbour's outline never covers a digit
+        return [f for f, _ in pieces if f] + [f for _, f in pieces]
+
+    segs = date_segments(burn["offset"], burn["duration"])
+    date = []
+    for a, b, wall in segs:
+        when = "" if len(segs) == 1 else f":enable='between(t,{a:.3f},{b if b is not None else 1e9:.3f})'"
+        date += [piece(f"{wall.year}", DC_X_DATE["year"], DC_DATE_TOP, when),
+                 piece("-", DC_X_DATE["dash2"], DC_DATE_TOP + DC_DASH_DROP, when),
+                 piece(f"{wall.month}", DC_X_DATE["month"], DC_DATE_TOP, when),
+                 piece("-", DC_X_DATE["dash1"], DC_DATE_TOP + DC_DASH_DROP, when),
+                 piece(f"{wall.day}", DC_X_DATE["day"], DC_DATE_TOP, when)]
+    whole = math.floor(burn["offset"])
+    frac = burn["offset"] - whole
+
+    def clock(fmt: str) -> str:         # the running time from the clip's own timestamps
+        return "%{pts\\:gmtime\\:" + str(whole) + "\\:" + fmt + "}"
+
+    time_ = lay([piece(clock("%H"), DC_X_TIME["hour"], DC_TIME_TOP),
+                 piece("\\:" + clock("%M"), DC_X_TIME["min"], DC_TIME_TOP),      # a literal colon needs \: even in quotes
+                 piece("\\:" + clock("%S"), DC_X_TIME["sec"], DC_TIME_TOP)])
+    if frac > 0.001:        # line the clock's second boundaries up with the camera's, then undo the shift
+        time_ = [f"setpts=PTS+{frac:.4f}/TB", *time_, f"setpts=PTS-{frac:.4f}/TB"]
+    return [*lay(date), *time_]
+
+
+def sar_factor(v: dict) -> float:
+    """Pixel aspect ratio of an anamorphic clip (1440x1080 AVCHD is 4:3), 1.0 for normal square pixels."""
+    try:
+        n, d = str(v.get("sample_aspect_ratio", "1:1")).split(":")
+        f = int(n) / int(d)
+    except (ValueError, ZeroDivisionError):
+        return 1.0
+    return f if f > 0 and abs(f - 1) > 0.01 else 1.0
+
+
+def video_graph_args(pre: list, burn: dict | None, post: list, w: int, h: int) -> list:
+    """ffmpeg arguments that pick the video stream, run the filters and burn the date in."""
+    chain = list(pre)
+    if burn:
+        chain += datecode_filters(burn, w, h)
+    chain += post
+    return ["-map", "0:v:0", *(["-vf", ",".join(chain)] if chain else [])]
+
+
+def plan_audio(acodecs: list, container: str, audio_mode: str) -> tuple:
+    """Per-stream audio args that never lose anything unless AAC was asked for.
+    Returns (args, lossy, first codec MP4 can't hold or None)."""
+    args, lossy, bad = [], False, None
+    for i, c in enumerate(acodecs):
+        if container == "mp4" and audio_mode == "aac" and c != "aac":
+            args += [f"-c:a:{i}", "aac", f"-b:a:{i}", "256k"]
+            lossy = True
+        elif c.startswith("pcm"):           # LPCM (some Sony models) can't be copied as is, so store it losslessly
+            args += [f"-c:a:{i}", "alac" if container == "mp4" else "flac"]
+        else:
+            if container == "mp4" and c not in MP4_AUDIO_COPY:
+                bad = bad or c
+            args += [f"-c:a:{i}", "copy"]
+    return args, lossy, bad
+
+
+def creation_meta(info: dict, st) -> list:
+    """creation_time from the file date, when the container has none (AVCHD never does)."""
+    tags = {k.lower() for k in (info.get("format", {}).get("tags") or {})}
+    if "creation_time" in tags:
+        return []
+    stamp = datetime.fromtimestamp(st.st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+    return ["-metadata", f"creation_time={stamp}"]
+
+
+def scan_clips(files: list, infos: dict) -> dict:
+    return {f: inspect_clip(f, infos[f]) for f in files}
+
+
+def ask_burn(clips: dict) -> bool:
+    """Offer to burn the recording date into the video, and say clearly what was or wasn't found."""
+    dated = [c["first"] for c in clips.values() if c["first"]]
+    if dated:
+        a, b = min(dated), max(dated)
+        model = next((c["model"] for c in clips.values() if c["model"]), "")
+        span = f"{a:%d-%m-%Y %H:%M:%S}" if a == b else f"{a:%d-%m-%Y %H:%M} to {b:%d-%m-%Y %H:%M}"
+        kv("Recorded", f"{span}   {escape(model)}")
+    else:
+        console.print("[yellow]No recording date was found in the video of these files.[/yellow]")
+    if find_font() is None:
+        console.print("[yellow]No usable font was found on this computer, the date can't be drawn.[/yellow]")
+        return False
+    return ask(qconfirm("Burn the recording date and time into the video (Handycam style)?", default=bool(dated)))
+
+
+def plan_burn(files: list, clips: dict) -> dict:
+    """Burn settings per clip. Clips with no usable date are never given a made-up one silently."""
+    font = find_font()
+    out, missing = {}, []
+    for f in files:
+        c = clips[f]
+        if c["offset"] is not None:
+            out[f] = {"offset": c["offset"], "font": font, "duration": c["duration"]}
+        else:
+            missing.append(f)
+    if missing:
+        names = ", ".join(m.name for m in missing[:5]) + ("..." if len(missing) > 5 else "")
+        console.print(f"[yellow]{len(missing)} clip(s) contain no recording date: {escape(names)}[/yellow]")
+        options = [questionary.Choice("Use the file's modified date (it is when the recording ENDED, may be off)", "mtime"),
+                   questionary.Choice("Skip these clips", "skip")]
+        if len(missing) == 1:
+            options.insert(1, questionary.Choice("Type the start date and time myself", "manual"))
+        how = ask(qselect("What should be used for them?", choices=options))
+        for f in missing:
+            if how == "skip":
+                out[f] = None
+                continue
+            if how == "manual":
+                s = ask(qtext("Start date and time (YYYY-MM-DD HH:MM:SS)",
+                              validate=lambda t: _valid_stamp(t) or "Use the format 2026-06-19 17:01:32"))
+                offset = calendar.timegm(datetime.strptime(s.strip(), "%Y-%m-%d %H:%M:%S").timetuple())
+            else:
+                end = datetime.fromtimestamp(f.stat().st_mtime)
+                offset = calendar.timegm(end.timetuple()) - clips[f]["duration"]
+            out[f] = {"offset": offset, "font": font, "duration": clips[f]["duration"]}
+    return out
+
+
+def _valid_stamp(t: str) -> bool:
+    try:
+        datetime.strptime(t.strip(), "%Y-%m-%d %H:%M:%S")
+        return True
+    except ValueError:
+        return False
+
+
+def ask_burn_quality(config: dict) -> dict:
+    crf = ask(qselect("Quality", choices=[questionary.Choice(t, v) for t, v in BURN_QUALITY],
+                                 default=config.get("burn_crf", 18)))
+    preset = ask(qselect("Encoding speed", choices=[questionary.Choice(t, v) for t, v in BURN_SPEEDS],
+                                    default=config.get("burn_preset", "medium")))
+    audio = ask(qselect("Audio", choices=[
+        questionary.Choice("Keep original audio", "keep"),
+        questionary.Choice("Convert to AAC 256 kbps (plays on more devices)", "aac")],
+        default=config.get("convert_audio", "keep")))
+    config.update({"burn_crf": crf, "burn_preset": preset, "convert_audio": audio})
+    save_config(config)
+    return {"crf": crf, "preset": preset, "audio": audio}
+
+
+def burn_quality(inp: Path, dst_dir: Path, stem: str, info: dict, burn: dict, crf: int, preset: str,
+                 audio_mode: str, ui: UI) -> Path:
+    """Re-encode to H.264 MP4 with the date burned in, keeping resolution, frame rate and all audio."""
+    v = video_stream(info)
+    if v is None:
+        raise RuntimeError("No video stream in this file")
+    duration = get_duration(info)
+    w, h = _int(v.get("width"), 1920), _int(v.get("height"), 1080)
+    acodecs = [s.get("codec_name", "") for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+    a_args, _, bad = plan_audio(acodecs, "mp4", audio_mode)
+    if bad:
+        ui.note(f"[yellow]  {escape(bad)} audio can't go into MP4, converting the audio to AAC 256 kbps[/yellow]")
+        a_args, _, _ = plan_audio(acodecs, "mp4", "aac")
+
+    pre = []
+    if is_interlaced(inp, v):
+        pre.append("bwdif=mode=send_frame:parity=auto:deint=interlaced")     # keeps the frame rate (29.97i -> 29.97p)
+        ui.tag("deinterlaced")
+    f = sar_factor(v)
+    if f != 1.0:                # anamorphic clips (for example 1440x1080) need square pixels for the text to look right
+        w = max(2, round(w * f / 2) * 2)
+        pre.append(f"scale={w}:{h},setsar=1")
+    st = inp.stat()
+    with tempfile.TemporaryDirectory(dir=dst_dir, prefix=".tmp_burn_") as td:
+        td = Path(td)
+        shutil.copy(burn["font"], td / "font.ttf")
+        out_try = td / "out.mp4"
+        ui.stage("encoding")
+        run_ffmpeg(["-i", str(inp), *video_graph_args(pre, burn, [], w, h), "-map", "0:a?", "-dn",
+                    "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
+                    *a_args, "-movflags", "+faststart", *creation_meta(info, st), out_try],
+                   ui, duration, cwd=td)
+        dst = unique_path(dst_dir, stem, ".mp4")
+        os.replace(out_try, dst)
+    os.utime(dst, (st.st_atime, st.st_mtime))
+    return dst
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -677,11 +1416,16 @@ def youtube_flow(link: dict) -> dict | None:
             n = len(items)
             title = pl.get("title") or "playlist"
             kind_txt = "auto-generated mix" if link["list_id"].startswith(("RD", "UL")) else "playlist"
-            console.print(f"\n[bold yellow]⚠ This link contains a whole {kind_txt}:[/] {escape(title)} - [bold]{n} videos[/]")
+            console.print(f"\n[bold yellow]! This link contains a whole {kind_txt}:[/] {escape(title)}  [bold]{n} videos[/]")
             console.print("[yellow]Downloading all of it can take a long time and a lot of disk space.[/yellow]")
-            whole = ask(questionary.confirm("Download the WHOLE playlist?", default=False))
-            if whole and n > BIG_PLAYLIST:
-                whole = ask(questionary.confirm(f"That's {n} videos - are you really sure?", default=False))
+            whole = ask(qconfirm("Download from the playlist?", default=False))
+            if whole:
+                labels = [f"{i + 1:>3}. {(e.get('title') or e['id'])[:70]}"
+                          + (f"  ({fmt_duration(e['duration'])})" if e.get("duration") else "")
+                          for i, e in enumerate(items)]
+                items = [items[i] for i in choose_items(labels, "videos")]
+                if len(items) > BIG_PLAYLIST:
+                    whole = ask(qconfirm(f"That's {len(items)} videos, are you really sure?", default=False))
             if whole:
                 entries = [{"url": f"https://www.youtube.com/watch?v={e['id']}", "title": e.get("title") or e["id"]}
                            for e in items]
@@ -689,7 +1433,7 @@ def youtube_flow(link: dict) -> dict | None:
                 folder = yt.utils.sanitize_filename(title, restricted=False)[:100].strip(" .") or "playlist"
             elif link["video_id"]:
                 url = single_video_url(link)
-                console.print("→ Playlist removed from the link - downloading just the video")
+                kv("Playlist", "removed from the link, downloading just the video")
             else:
                 console.print("[yellow]This link is a playlist only, there's no single video in it.[/yellow]")
                 return None
@@ -712,22 +1456,22 @@ def youtube_flow(link: dict) -> dict | None:
             console.print("[yellow]Live streams aren't supported.[/yellow]")
             return None
         title = info.get("title") or "video"
-        console.print(f"→ Found: [bold]{escape(title)}[/]  ({fmt_duration(info.get('duration'))})")
+        kv("Video", f"{escape(title)}  [dim]({fmt_duration(info.get('duration'))})[/]")
         entries = [{"url": url, "title": title}]
         heights = sorted({r for f in info.get("formats", []) if f.get("vcodec") not in (None, "none")
                           for r in [_res(f)] if r})
 
     # ── questions ────────────────────────────────────────────────────────────
-    mode = ask(questionary.select("Download as", choices=[
+    mode = ask(qselect("Download as", choices=[
         questionary.Choice("Video (with audio)", "video"),
         questionary.Choice("Audio only", "audio"),
     ]))
     audio_only = mode == "audio"
-    height = abr = None
+    height = abr = 0            # 0 means "best available" (questionary turns a None value into the title text)
 
     if audio_only:
-        abr = ask(questionary.select("Audio quality", choices=[
-            questionary.Choice("Best available", None),
+        abr = ask(qselect("Audio quality", choices=[
+            questionary.Choice("Best available", 0),
             questionary.Choice("Standard (up to 128 kbps)", 128),
             questionary.Choice("Small (up to 64 kbps)", 64),
         ]))
@@ -736,12 +1480,12 @@ def youtube_flow(link: dict) -> dict | None:
         caps = [h for h in VIDEO_HEIGHTS if best is None or h < best]
         best_txt = f"Best available ({best}p)" if best else "Best available"
         suffix = "" if len(entries) == 1 else "  (per video, lower if it has less)"
-        height = ask(questionary.select("Video quality", choices=[
-            questionary.Choice(best_txt + suffix, None),
+        height = ask(qselect("Video quality", choices=[
+            questionary.Choice(best_txt + suffix, 0),
             *[questionary.Choice(f"{h}p" + suffix, h) for h in caps],
         ]))
 
-    compress = ask(questionary.confirm("Compress it after downloading?", default=True))
+    compress = ask(qconfirm("Compress it after downloading?", default=True))
     return {"entries": entries, "folder": folder, "audio_only": audio_only,
             "height": height, "abr": abr, "compress": compress}
 
@@ -765,71 +1509,169 @@ def ask_options(kind: str, has_audio: bool, config: dict) -> dict:
         questionary.Choice("50 MiB   ← good balance", 50),
         questionary.Choice("100 MiB  ← high quality longer content", 100),
         questionary.Choice("500 MiB", 500),
-        questionary.Choice("Custom...", None),
+        questionary.Choice("Custom...", "custom"),
     ]
-    target_mib = ask(questionary.select("Target size (MiB)", choices=size_choices))
-    if target_mib is None:
-        target_mib = int(ask(questionary.text(
+    target_mib = ask(qselect("Target size (MiB)", choices=size_choices))
+    if target_mib == "custom":
+        target_mib = int(ask(qtext(
             "Custom size (MiB)", default="10",
             validate=lambda t: (t.isdigit() and int(t) > 0) or "Enter a whole number above 0")))
-    console.print(f"→ Target: [bold]{target_mib} MiB[/]")
 
     fmts = allowed_formats(kind, has_audio)
-    fmt = ask(questionary.select(
+    fmt = ask(qselect(
         "Output format", choices=[questionary.Choice(f"{f['name']}  •  {f['group']}", f) for f in fmts]))
-    level = ask(questionary.select("Compression level (speed ↔ quality)", choices=COMPRESSION_LEVELS))
+    level = ask(qselect("Compression level (speed ↔ quality)", choices=COMPRESSION_LEVELS))
 
     use_gpu = use_2pass = False
+    fps = "original"
     saturation = 100.0
 
     if fmt["kind"] == "video":
         if fmt["name"] == "MP4" and nvenc_works():
-            use_gpu = ask(questionary.confirm("GPU (NVENC) encoding?", default=bool(config.get("gpu", False))))
+            use_gpu = ask(qconfirm("GPU (NVENC) encoding?", default=bool(config.get("gpu", False))))
             config["gpu"] = use_gpu
         if use_gpu:
             console.print("[dim]GPU encoding is single-pass[/dim]")
         else:
-            use_2pass = ask(questionary.confirm("2-pass encoding? (slower, more accurate size)",
+            use_2pass = ask(qconfirm("2-pass encoding? (slower, more accurate size)",
                                                 default=bool(config.get("two_pass", True))))
             config["two_pass"] = use_2pass
         save_config(config)
-        console.print(f"→ GPU: [bold]{'ON' if use_gpu else 'OFF'}[/]   2-pass: [bold]{'ON' if use_2pass else 'OFF'}[/]")
+
+        fps = ask(qselect("Frame rate", choices=[questionary.Choice(t, v) for t, v in FPS_CHOICES]))
 
     if fmt["kind"] in ("video", "image"):
-        raw_sat = ask(questionary.text("Saturation multiplier (%) - press Enter for 100%", default="100")).strip()
+        raw_sat = ask(qtext("Saturation multiplier (%) - press Enter for 100%", default="100")).strip()
         try:
             saturation = max(0.0, min(200.0, float(raw_sat)))
         except ValueError:
             console.print("[yellow]Invalid value → using 100%[/yellow]")
-        console.print(f"→ Saturation: [bold]{saturation:g}%[/]")
 
     return {"target_mib": target_mib, "fmt": fmt, "level": level,
-            "use_gpu": use_gpu, "use_2pass": use_2pass, "saturation": saturation}
+            "use_gpu": use_gpu, "use_2pass": use_2pass, "fps": fps, "saturation": saturation}
 
 
-def compress_one(path: Path, dest: Path, o: dict, info: dict, ui: UI) -> Path:
+def compress_one(path: Path, dest: Path, o: dict, info: dict, ui: UI, burn: dict | None = None) -> Path:
     fmt, stem = o["fmt"], path.stem + "_compressed"
     if fmt["kind"] == "video":
         return compress_video(path, dest, stem, o["target_mib"], o["level"], fmt, info,
-                              o["saturation"], o["use_2pass"], o["use_gpu"], ui)
+                              o["saturation"], o["use_2pass"], o["use_gpu"], o["fps"], ui, burn=burn)
     if fmt["kind"] == "audio":
         return compress_audio(path, dest, stem, o["target_mib"], o["level"], fmt, info, ui)
     return compress_image(path, dest, stem, o["target_mib"], o["level"], fmt, info, o["saturation"], ui)
 
 
-def run_job(config: dict) -> None:
-    """One full job: pick input (file or link), ask options, process. Settings live in `config`."""
-    out_folder = Path(config.get("output_folder") or DEFAULT_OUTPUT_FOLDER)
-    plan = input_path = info = None
+def output_category(job: str, plan: dict | None, local: list) -> str:
+    """Which subfolder of the output folder a job's results go into."""
+    if plan:
+        return "youtube_compressed" if plan["compress"] else "youtube"
+    avchd = bool(local) and all(f.suffix.lower() in MTS_EXTS for f in local)     # Handycam clips
+    if job == "convert":
+        return "avchd_converted" if avchd else "converted"
+    if job == "burn_hq":
+        return "avchd_datecode"
+    return "avchd_compressed" if avchd else "compressed"
 
-    # ── Input loop (file path or YouTube link) ───────────────────────────────
+
+def fmt_rate(bps: float) -> str:
+    return f"{bps / 1e6:.1f} Mb/s" if bps >= 1e6 else f"{bps / 1e3:.0f} kb/s"
+
+
+def media_lines(info: dict, path: Path, kind: str) -> list:
+    """Compact technical summary of a file: [(label, text)] for Video / Audio / Image / File."""
+    fmt = info.get("format", {})
+    size = path.stat().st_size
+    dur = _float(fmt.get("duration"))
+    total = _float(fmt.get("bit_rate")) or (size * 8 / dur if dur else None)
+    audios = [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+    a_bps = sum(_float(a.get("bit_rate"), 0.0) for a in audios)
+    rows = []
+    v = video_stream(info)
+    if v and kind == "image":
+        rows.append(("Image", f"{v.get('codec_name', '?')}, {v.get('width')}x{v.get('height')}, {v.get('pix_fmt', '')}".rstrip(", ")))
+    elif v:
+        bits = [f"{v.get('codec_name', '?')}{' ' + v['profile'] if v.get('profile') else ''}",
+                f"{v.get('width')}x{v.get('height')}",
+                f"{float(get_fps(v)):.3f}".rstrip("0").rstrip(".") + " fps"]
+        scan = {"progressive": "progressive"}.get(v.get("field_order"), "interlaced" if v.get("field_order") in ("tt", "bb", "tb", "bt") else "")
+        if scan:
+            bits[-1] += f" {scan}"
+        if v.get("pix_fmt"):
+            bits.append(v["pix_fmt"])
+        vb = _float(v.get("bit_rate"))
+        if vb:
+            bits.append(fmt_rate(vb))
+        elif total and total > a_bps:           # many containers (MPEG-TS) don't state it, so estimate from the total
+            bits.append("~" + fmt_rate(total - a_bps))
+        rows.append(("Video", ", ".join(bits)))
+    if audios:
+        a = audios[0]
+        ch = _int(a.get("channels"))
+        layout = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch}ch" if ch else "")
+        bits = [a.get("codec_name", "?"), layout]
+        if _float(a.get("sample_rate")):
+            bits.append(f"{float(a['sample_rate']) / 1000:g} kHz")
+        if _float(a.get("bit_rate")):
+            bits.append(fmt_rate(float(a["bit_rate"])))
+        extra = f"  (+{len(audios) - 1} more)" if len(audios) > 1 else ""
+        rows.append(("Audio", ", ".join(b for b in bits if b) + extra))
+    names = fmt.get("format_name", "")
+    box = path.suffix[1:].upper() + (" (MPEG-TS)" if "mpegts" in names else "")
+    parts = [box, fmt_bytes(size)]
+    if dur and kind != "image":
+        parts.append(fmt_duration(dur))
+    if total and kind != "image":
+        parts.append(fmt_rate(total))
+    rows.append(("File", ", ".join(p for p in parts if p.strip())))
+    return rows
+
+
+def print_banner() -> None:
+    tree = ("AVCHD\n"
+            "[dim]\u2514\u2500\u2500\u2500[/]BDMV\n"
+            "    [dim]\u251c\u2500\u2500\u2500[/]CLIPINF\n"
+            "    [dim]\u251c\u2500\u2500\u2500[/]PLAYLIST\n"
+            "    [dim]\u2514\u2500\u2500\u2500[/]STREAM")
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold cyan", no_wrap=True)
+    grid.add_column()
+    grid.add_row("Single file", "drag in the video to compress or convert it")
+    grid.add_row("Bulk", "drag in the folder with the videos (all or pick)")
+    grid.add_row("YouTube", "paste a link, playlists too (all or pick)")
+    grid.add_row("Handycam", "drag in the whole AVCHD folder to convert,")
+    grid.add_row("", "compress or burn in the recording date.")
+    grid.add_row("", "It must contain this folder tree:")
+    grid.add_row("", tree)
+    console.print(Panel(
+        Group("[bold cyan]RATECAP[/]",
+              "[dim]compress | convert | YouTube | AVCHD date burn-in | bulk[/]",
+              "", grid),
+        border_style="cyan", padding=(0, 2), expand=False))
+
+
+def _label_clip(f: Path, clips: dict, root: Path | None) -> str:
+    c = clips.get(f)
+    when = f"{c['first']:%d-%m-%Y %H:%M:%S}" if c and c["first"] else "no date"
+    dur = fmt_duration(c["duration"]) if c else ""
+    return f"{f.name:<12} {when:<19} {dur:>7}  {fmt_bytes(f.stat().st_size):>10}"
+
+
+def run_job(config: dict) -> None:
+    """One full job: pick the input (file, folder or link), choose what to do, process. Settings live in `config`."""
+    out_folder = Path(config.get("output_folder") or DEFAULT_OUTPUT_FOLDER)
+    plan = info = folder_name = root = None
+    local, clips, infos = [], {}, {}
+
+    # ── 1  Input ─────────────────────────────────────────────────────────────
+    section("1  Input")
+    kv("Output", f"{escape(str(out_folder))}  [dim](Enter with nothing typed = change it)[/]")
     while True:
-        raw = ask(questionary.path("Input file or YouTube link (press Enter to change output folder)",
-                                   default="")).strip().strip("\"'")
+        typed = ask(qpath("Video, folder or YouTube link", default="")).strip()
+        parts = split_paths(typed)
+        raw = parts[0] if len(parts) == 1 else typed
 
         if not raw:
-            console.print(f"Current output folder: [bold]{escape(str(out_folder))}[/]")
-            new = ask(questionary.text("New output folder path (Enter to keep current)", default="")).strip().strip("\"'")
+            new = ask(qtext("New output folder (Enter = keep current)", default="")).strip().strip("\"'")
             if new:
                 p = Path(new).expanduser().resolve()
                 try:
@@ -840,12 +1682,10 @@ def run_job(config: dict) -> None:
                     out_folder = p
                     config["output_folder"] = str(p)
                     save_config(config)
-                    console.print(f"→ Output folder updated and saved: [bold]{escape(str(p))}[/]")
-            else:
-                console.print("[dim]No change[/dim]")
+                    kv("Output", f"{escape(str(p))}  [green]saved[/]")
             continue
 
-        link = parse_link(raw)
+        link = parse_link(raw) if len(parts) == 1 else None
         if link:
             plan = youtube_flow(link)
             if plan is None:
@@ -853,100 +1693,229 @@ def run_job(config: dict) -> None:
             kind = "audio" if plan["audio_only"] else "video"
             break
 
-        input_path = Path(raw).expanduser()
-        if not input_path.is_file():
-            console.print("[red]File not found - try again[/red]")
+        if len(parts) > 1:                          # several files (or folders) dragged in together
+            dropped = [Path(x).expanduser() for x in parts]
+            gone = [d.name or str(d) for d in dropped if not d.exists()]
+            if gone:
+                console.print(f"[red]Not found:[/red] {escape(', '.join(gone[:5]))}{'...' if len(gone) > 5 else ''}")
+                continue
+            files = []
+            for d in dropped:
+                files += collect_videos(d, out_folder) if d.is_dir() else [d]
+            kept, skipped = [], []
+            with console.status("[bold green]Reading files..."):
+                for f in dict.fromkeys(files):      # drop duplicates, keep the order
+                    try:
+                        i_ = get_media_info(f)
+                    except (subprocess.CalledProcessError, ValueError):
+                        skipped.append(f.name)
+                        continue
+                    if detect_type(i_) == "video":
+                        kept.append(f)
+                        infos[f] = i_
+                    else:
+                        skipped.append(f.name)
+            if skipped:
+                console.print(f"[yellow]Skipped {len(skipped)} file(s) that are not videos: "
+                              f"{escape(', '.join(skipped[:4]))}{'...' if len(skipped) > 4 else ''}[/yellow]")
+            if not kept:
+                console.print("[red]No video files in that selection[/red]")
+                continue
+            local, kind = kept, "video"
+            parents = {f.parent for f in kept}
+            if len(parents) == 1:                   # all from one folder: behave like dragging that folder in
+                root = next(iter(parents))
+                folder_name = re.sub(r'[<>:"/\\|?*]', "_", root.name) or "videos"
+            kv("Source", f"{len(kept)} files dragged in")
+            kv("Found", f"{len(kept)} video file(s), {fmt_bytes(sum(f.stat().st_size for f in kept))}")
+            break
+
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            stream = find_avchd_stream(path)        # a camcorder card or a copy of it
+            with console.status("[bold green]Scanning folder..."):
+                if stream:
+                    found = sorted((p for p in stream.iterdir() if p.suffix.lower() in MTS_EXTS), key=lambda p: p.name.lower())
+                else:
+                    found = collect_videos(path, out_folder)
+            if not found:
+                console.print("[red]No video files found in that folder[/red]")
+                continue
+            local, kind, root = found, "video", path
+            folder_name = re.sub(r'[<>:"/\\|?*]', "_", path.name) or "videos"
+            if stream and folder_name.upper() in {"VIDEOS", "STREAM", "BDMV", "AVCHD", "PRIVATE"}:
+                folder_name = "handycam"
+            kv("Source", escape(str(path)))
+            kv("Found", f"{'[bold]AVCHD recording[/], ' if stream else ''}{len(found)} video file(s), "
+                        f"{fmt_bytes(sum(f.stat().st_size for f in found))}")
+            break
+        if not path.is_file():
+            console.print("[red]File or folder not found, try again[/red]")
             continue
         try:
-            info = get_media_info(input_path)
+            info = get_media_info(path)
         except (subprocess.CalledProcessError, ValueError):
-            console.print("[red]ffprobe can't read that file - is it really media?[/red]")
+            console.print("[red]ffprobe can't read that file, is it really media?[/red]")
             continue
         kind = detect_type(info)
         if kind == "unknown":
             console.print("[red]No audio/video/image stream found in that file[/red]")
             continue
+        local = [path]
+        kv("Source", escape(path.name))
+        for label, text in media_lines(info, path, kind):
+            kv(label, text)
         break
 
-    dest = out_folder / plan["folder"] if plan and plan["folder"] else out_folder
-    dest.mkdir(parents=True, exist_ok=True)
-    console.print(f"→ Using output folder: [bold]{escape(str(dest))}[/]")
-    if plan is None:
-        console.print(f"→ Detected: [bold]{kind.upper()}[/]")
+    # Handycam clips: read their recording dates now, so the pick list can show them
+    is_mts = plan is None and bool(local) and all(f.suffix.lower() in MTS_EXTS for f in local)
+    if is_mts:
+        with console.status("[bold green]Reading recording dates..."):
+            for f in local:
+                try:
+                    infos[f] = infos.get(f) or (info if (len(local) == 1 and info) else get_media_info(f))
+                except (subprocess.CalledProcessError, ValueError):
+                    pass            # reported later like any unreadable file
+            clips = scan_clips([f for f in local if f in infos], infos)
+    if plan is None and len(local) > 1:
+        labels = [_label_clip(f, clips, root) if is_mts else f"{f.relative_to(root) if root else f.name}   "
+                  f"{fmt_bytes(f.stat().st_size)}" for f in local]
+        chosen = choose_items(labels, "clips" if is_mts else "videos")
+        local = [local[i] for i in chosen]
+        if len(local) < len(labels):
+            kv("Selected", f"{len(local)} of {len(labels)}")
 
-    # ── Compression options (skipped when just downloading) ──────────────────
-    opts = None
-    if plan is None or plan["compress"]:
-        opts = ask_options(kind, True if plan else audio_stream(info) is not None, config)
-        if plan is None and input_path.stat().st_size <= opts["target_mib"] * 1_048_576:
-            console.print(f"[yellow]Note: input is already under {opts['target_mib']} MiB - "
+    # ── 2  Options ───────────────────────────────────────────────────────────
+    section("2  Options")
+    job, burn_map, bq = "compress", {}, None
+    if is_mts and ask_burn({f: clips[f] for f in local if f in clips}):
+        job = ask(qselect("How should it be saved?", choices=[
+            questionary.Choice("Keep high quality (no size limit)", "burn_hq"),
+            questionary.Choice("Compress to a target size", "compress"),
+        ]))
+        burn_map = plan_burn([f for f in local if f in clips], clips)
+        skipped = [f for f in local if f in burn_map and burn_map[f] is None]
+        if skipped:
+            local = [f for f in local if f not in skipped]
+            console.print(f"[yellow]Skipping {len(skipped)} clip(s) without a recording date[/yellow]")
+        if not local:
+            console.print("[yellow]Nothing left to process[/yellow]")
+            return
+    elif plan is None and kind == "video":
+        job = ask(qselect("What do you want to do?", choices=[
+            questionary.Choice("Compress to a target size", "compress"),
+            questionary.Choice("Convert without re-encoding (lossless, e.g. camcorder MTS to MP4)", "convert"),
+        ]))
+
+    dest = out_folder / output_category(job, plan, local)
+    sub = plan["folder"] if plan and plan["folder"] else folder_name      # playlist or input folder name
+    if sub:
+        dest = dest / sub
+    dest.mkdir(parents=True, exist_ok=True)
+
+    opts = copts = None
+    if job == "convert":
+        copts = ask_convert_options(config)
+    elif job == "burn_hq":
+        bq = ask_burn_quality(config)
+    elif plan is None or plan["compress"]:
+        has_audio = True if (plan or root or len(local) > 1) else audio_stream(info) is not None
+        opts = ask_options(kind, has_audio, config)
+        if len(local) == 1 and local[0].stat().st_size <= opts["target_mib"] * 1_048_576:
+            console.print(f"[yellow]Note: the input is already under {opts['target_mib']} MiB, "
                           f"re-encoding may not make it smaller[/yellow]")
 
-    # ── Run ──────────────────────────────────────────────────────────────────
-    items = plan["entries"] if plan else [{"url": None, "title": input_path.name}]
+    # ── 3  Processing ────────────────────────────────────────────────────────
+    items = plan["entries"] if plan else [{"url": None, "path": f, "title": f.name} for f in local]
+    section("3  Processing")
+    if plan:
+        what = "audio only" if plan["audio_only"] else (f"video up to {plan['height']}p" if plan["height"] else "video, best quality")
+        kv("Job", f"YouTube download, {what}{', then compress' if plan['compress'] else ''}")
+    elif job == "convert":
+        kv("Job", f"Lossless convert to {copts['container'].upper()}, "
+                  f"audio {'kept' if copts['audio'] == 'keep' else 'to AAC'}, verify {'on' if copts['verify'] else 'off'}")
+    elif job == "burn_hq":
+        kv("Job", f"Burn in recording date, H.264 MP4, CRF {bq['crf']}, {bq['preset']}, audio {'kept' if bq['audio'] == 'keep' else 'to AAC'}")
+    else:
+        extra = ", 2-pass" if opts["use_2pass"] else ", GPU" if opts["use_gpu"] else ""
+        fps = "" if opts["fps"] == "original" else ", adaptive fps" if opts["fps"] == "auto" else f", {float(opts['fps']):g} fps"
+        sat = "" if opts["saturation"] == 100 else f", saturation {opts['saturation']:g}%"
+        kv("Job", f"{'Burn in date and ' if burn_map else ''}compress to {opts['target_mib']} MiB, "
+                  f"{opts['fmt']['name']}, {opts['level']}{extra}{fps}{sat}")
+    kv("Files", f"{len(items)}")
+    kv("Output", escape(str(dest)))
+    console.print()
+
     results, failures = [], []
     tmp_root = Path(tempfile.mkdtemp(dir=dest, prefix=".tmp_download_")) if plan and opts else None
     t0 = time.perf_counter()
-    progress = Progress(SpinnerColumn("dots12"), TextColumn("[bold green]{task.description}"), BarColumn(),
-                        TaskProgressColumn(), TimeElapsedColumn(), console=console, transient=True)
+    progress = Progress(
+        SpinnerColumn("dots12"),
+        TextColumn("{task.description}", table_column=Column(no_wrap=True, overflow="ellipsis", ratio=1)),
+        BarColumn(bar_width=26), TaskProgressColumn(), TimeElapsedColumn(), TimeRemainingColumn(),
+        console=console, transient=True, expand=True)
     try:
         with progress:
-            ui = UI(progress)
+            ui = UI(progress, len(items))
             for i, item in enumerate(items, 1):
-                short = escape(item["title"][:40])
-                label = f"{i}/{len(items)} · {short}" if len(items) > 1 else short
+                ui.begin(i, item["title"])
+                t_file = time.perf_counter()
+                dst = src_size = None
                 try:
                     if plan:
                         prefix = f"{i:02d} - " if len(items) > 1 else ""
-                        path = download_one(item["url"], tmp_root or dest, prefix, plan, ui, label)
+                        path = download_one(item["url"], tmp_root or dest, prefix, plan, ui, ui.name)
                         if opts is None:
-                            results.append(path)
-                            continue
-                        file_info = get_media_info(path)
+                            dst = path
+                        else:
+                            src_size = path.stat().st_size
+                            file_info = get_media_info(path)
                     else:
-                        path, file_info = input_path, info
-                    results.append(compress_one(path, dest, opts, file_info, ui))
-                    if plan:
-                        path.unlink(missing_ok=True)       # keep only the compressed copy
-                except (RuntimeError, OSError, ValueError, subprocess.CalledProcessError) as e:
+                        path = item["path"]
+                        src_size = path.stat().st_size
+                        file_info = infos.get(path) or (info if len(local) == 1 and info else get_media_info(path))
+                    if dst is None:
+                        if job == "convert":
+                            dst = convert_one(path, dest, copts, file_info, ui)
+                        elif job == "burn_hq":
+                            dst = burn_quality(path, dest, path.stem + "_datecode", file_info, burn_map[path],
+                                               bq["crf"], bq["preset"], bq["audio"], ui)
+                        else:
+                            dst = compress_one(path, dest, opts, file_info, ui, burn_map.get(path))
+                        if plan:
+                            path.unlink(missing_ok=True)       # keep only the compressed copy
+                    results.append(dst)
+                    ui.done(i, item["title"], dst, time.perf_counter() - t_file, src_size)
+                except subprocess.CalledProcessError:
                     failures.append(item["title"])
-                    console.print(f"[bold red]Failed:[/] {escape(item['title'][:60])}\n  {escape(str(e))}")
+                    ui.fail(i, item["title"], "Can't read this file (corrupt or not a video)", time.perf_counter() - t_file)
+                except (RuntimeError, OSError, ValueError) as e:
+                    failures.append(item["title"])
+                    ui.fail(i, item["title"], str(e), time.perf_counter() - t_file)
     finally:
         if tmp_root:
             shutil.rmtree(tmp_root, ignore_errors=True)
 
-    # ── Summary ──────────────────────────────────────────────────────────────
-    elapsed = time.perf_counter() - t0
+    # ── Result ───────────────────────────────────────────────────────────────
+    color = "green" if not failures else "yellow"
+    kv("Finished", f"[{color}]{len(results)} of {len(items)} file(s)[/] in {fmt_secs(time.perf_counter() - t0)}"
+                   + (f"   [red]{len(failures)} failed[/]" if failures else ""))
     if results:
-        console.print(f"\n[bold green]Done![/]   {len(results)} file(s) in {elapsed:.0f}s")
-        for r in results[:20]:
-            size_mib = r.stat().st_size / 1_048_576
-            extra = f"  ({size_mib / opts['target_mib']:.0%} of target)" if opts else ""
-            console.print(f"   {size_mib:7.2f} MiB{extra}  → [bold]{escape(str(r))}[/bold]")
-        if len(results) > 20:
-            console.print(f"   [dim]... and {len(results) - 20} more[/dim]")
-    if failures:
-        console.print(f"[yellow]{len(failures)} item(s) failed[/yellow]")
+        kv("Total size", fmt_bytes(sum(r.stat().st_size for r in results if r.exists())))
+    kv("Output", escape(str(dest)))
 
 
 def main() -> None:
     check_ffmpeg()
-
-    console.print(Panel.fit(
-        "[bold cyan]RATECAP[/]\n"
-        "Hit an exact target size with FFmpeg, saturation control, YouTube download\n"
-        "[dim]Paste a YouTube link instead of a file to download it first[/dim]",
-        border_style="cyan"
-    ))
+    print_banner()
 
     config = load_config()
     while True:                     # output folder, 2-pass and GPU choices carry over between jobs
         run_job(config)
         console.print()
-        if not ask(questionary.confirm("Process another file?", default=True)):
+        if not ask(qconfirm("Process something else?", default=True)):
             console.print("[dim]Goodbye![/dim]")
             break
-        console.print()
 
 
 if __name__ == "__main__":

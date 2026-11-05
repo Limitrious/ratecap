@@ -1,3 +1,4 @@
 compressed_output/
 .vscode/
-compressor_config.json
+output/
+config.json
