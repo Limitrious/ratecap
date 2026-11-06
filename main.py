@@ -23,16 +23,22 @@ import math
 import os
 import re
 import shutil
+import threading
 import subprocess
 import sys
 import tempfile
 import time
+import queue
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import questionary
+from prompt_toolkit.application import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
+from questionary.prompts.common import InquirerControl, create_inquirer_layout
 from rich.console import Console
 from rich.markup import escape
 from rich.console import Group
@@ -138,12 +144,19 @@ def ask(question):
     return answer
 
 
+_PATH_LOCK = threading.Lock()
+
+
 def unique_path(folder: Path, stem: str, ext: str) -> Path:
-    p = folder / f"{stem}{ext}"
-    n = 1
-    while p.exists():
-        p = folder / f"{stem}_{n}{ext}"
-        n += 1
+    """A free path under `folder`. Reserves it immediately (empty file) so two concurrent jobs never collide,
+    even on the same stem; every caller replaces this placeholder with the real file right after."""
+    with _PATH_LOCK:
+        p = folder / f"{stem}{ext}"
+        n = 1
+        while p.exists():
+            p = folder / f"{stem}_{n}{ext}"
+            n += 1
+        p.touch()
     return p
 
 
@@ -360,6 +373,155 @@ def qpath(*a, **k):
     return questionary.path(*a, **k)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# GOING BACK: every multi-question flow below (compress options, YouTube quality, convert, burn-in
+# quality) can return to its previous question instead of forcing a restart of the whole program.
+# ──────────────────────────────────────────────────────────────────────────────
+
+BACK = object()          # sentinel: "go back one question" in one of those flows
+
+
+def qselect_back(message: str, choices: list, back_ok: bool = True, default=None):
+    """qselect with a "<< Back" choice appended when back_ok. `choices` may hold raw values, (label, value)
+    pairs, or questionary.Choice objects; returns BACK if the person picks it instead of a real answer."""
+    opts = []
+    for c in choices:
+        if isinstance(c, questionary.Choice):
+            opts.append(c)
+        elif isinstance(c, tuple):
+            opts.append(questionary.Choice(c[0], c[1]))
+        else:
+            opts.append(questionary.Choice(str(c), c))
+    if back_ok:
+        opts.append(questionary.Choice("<< Back", BACK))
+    return ask(qselect(message, choices=opts, default=default))
+
+
+def back_validate(fn):
+    """Wrap a qtext validator so typing b/back always passes, letting qtext_back return BACK for it."""
+    return lambda t: True if t.strip().lower() in ("b", "back") else fn(t)
+
+
+def qtext_back(message: str, default: str = "", validate=None, back_ok: bool = True) -> str:
+    """Text input where typing b or back returns BACK. The field starts EMPTY (not pre-filled with
+    `default`), so b/back is always one clean keystroke rather than needing to clear a pre-filled value
+    first; pressing Enter with nothing typed returns `default` itself, when there's no stricter validator
+    saying otherwise."""
+    parts = []
+    if default and not validate:
+        parts.append(f"Enter for {default}")
+    if back_ok:
+        parts.append("b to go back")
+    hint = f"  [{', '.join(parts)}]" if parts else ""
+    v = back_validate(validate) if validate else None
+    raw = ask(qtext(f"{message}{hint}", default="", validate=v) if v else qtext(f"{message}{hint}", default=""))
+    if back_ok and raw.strip().lower() in ("b", "back"):
+        return BACK
+    return raw if raw.strip() else default
+
+
+def qcheckbox_range(message: str, labels: list, back_ok: bool = True):
+    """Like qcheckbox, with two extras: Shift+Down/Shift+Up drag-selects a range from the last place Space
+    was pressed (like Shift-click in a file manager), and Escape returns BACK instead of the selection,
+    when back_ok. Returns the chosen indexes (sorted), or BACK."""
+    choices = [questionary.Choice(lbl, i) for i, lbl in enumerate(labels)]
+    ic = InquirerControl(choices, None, pointer=">")
+    anchor = ic.pointed_at
+
+    def instruction():
+        return ("(Space selects, Shift+Up/Down extends the selection, a = all, i = invert, "
+                f"Enter = confirm{', Esc = back' if back_ok else ''})")
+
+    def get_prompt_tokens():
+        tokens = [("class:qmark", "?"), ("class:question", f" {message} ")]
+        if ic.is_answered:
+            tokens.append(("class:answer", f"done ({len(ic.selected_options)} selected)"))
+        else:
+            tokens.append(("class:instruction", instruction()))
+        return tokens
+
+    def selected_values():
+        return [c.value for c in ic.get_selected_values()]
+
+    def extend_to(target: int):
+        lo, hi = sorted((anchor, target))
+        for i in range(lo, hi + 1):
+            v = ic.choices[i].value
+            if v not in ic.selected_options:
+                ic.selected_options.append(v)
+
+    bindings = KeyBindings()
+
+    @bindings.add(Keys.ControlQ, eager=True)
+    @bindings.add(Keys.ControlC, eager=True)
+    def _ctrlc(event):
+        event.app.exit(exception=KeyboardInterrupt, style="class:aborting")
+
+    if back_ok:
+        @bindings.add(Keys.Escape, eager=True)
+        def _esc(event):
+            ic.is_answered = True
+            event.app.exit(result=BACK)
+
+    @bindings.add(" ", eager=True)
+    def _toggle(event):
+        nonlocal anchor
+        v = ic.get_pointed_at().value
+        if v in ic.selected_options:
+            ic.selected_options.remove(v)
+        else:
+            ic.selected_options.append(v)
+        anchor = ic.pointed_at
+
+    @bindings.add("a", eager=True)
+    def _all(event):
+        if len(ic.selected_options) == len(ic.choices):
+            ic.selected_options = []
+        else:
+            ic.selected_options = [c.value for c in ic.choices]
+
+    @bindings.add("i", eager=True)
+    def _invert(event):
+        ic.selected_options = [c.value for c in ic.choices if c.value not in ic.selected_options]
+
+    @bindings.add(Keys.Down, eager=True)
+    @bindings.add("j", eager=True)
+    def _down(event):
+        ic.select_next()
+
+    @bindings.add(Keys.Up, eager=True)
+    @bindings.add("k", eager=True)
+    def _up(event):
+        ic.select_previous()
+
+    @bindings.add(Keys.ShiftDown, eager=True)
+    def _shift_down(event):
+        ic.select_next()
+        extend_to(ic.pointed_at)
+
+    @bindings.add(Keys.ShiftUp, eager=True)
+    def _shift_up(event):
+        ic.select_previous()
+        extend_to(ic.pointed_at)
+
+    @bindings.add(Keys.ControlM, eager=True)
+    def _enter(event):
+        ic.is_answered = True
+        event.app.exit(result=selected_values())
+
+    @bindings.add(Keys.Any)
+    def _other(event):
+        pass
+
+    app = Application(layout=create_inquirer_layout(ic, get_prompt_tokens),
+                      key_bindings=bindings, style=_style())
+    result = questionary.Question(app).ask()
+    return result if result is BACK else sorted(result)
+
+
+
+
+
 def split_paths(raw: str) -> list:
     """Dragging several files into the window pastes them as one line: "a.mp4" "b.mp4" ... Split that into paths."""
     raw = raw.strip()
@@ -392,87 +554,149 @@ def fmt_bytes(n: float) -> str:
     return f"{n / 1_073_741_824:.2f} GiB" if n >= 1_073_741_824 else f"{n / 1_048_576:.2f} MiB"
 
 
-class UI:
-    """Live bars for the file being processed (and the whole batch). Finished files stay printed above them."""
+def cpu_count() -> int:
+    return os.cpu_count() or 4
 
-    def __init__(self, progress: Progress, total: int = 1):
+
+def ffmpeg_threads(workers: int) -> int:
+    """Threads for ONE ffmpeg when `workers` of them run at once, so together they don't oversubscribe the CPU."""
+    return max(1, cpu_count() // max(1, workers))
+
+
+class UI:
+    """Coordinates a batch: the overall bar and file counter shared by every lane, plus one lane per
+    worker. workers=1 (the default) gives a single lane, used exactly like the old one-bar UI."""
+
+    def __init__(self, progress: Progress, total: int = 1, workers: int = 1):
         self.p, self.total = progress, total
         self.done_n = 0
+        self._lock = threading.Lock()
+        self._seen = set()
         self.overall = progress.add_task("", total=total) if total > 1 else None
-        self.cur = progress.add_task("", total=100)
-        self.name, self.prefix, self.tags, self._seen = "", "", [], set()
+        self.lanes = [Lane(self, progress.add_task("", total=100)) for _ in range(max(1, workers))]
         self._refresh()
 
-    def _refresh(self, frac: float = 0.0) -> None:
+    def lane(self, n: int = 0) -> "Lane":
+        """The n-th worker's bar. Each concurrent worker must use its own lane; nothing else is shared state."""
+        return self.lanes[n % len(self.lanes)]
+
+    def _num(self, i: int) -> str:
+        return f"[dim]{i:>{len(str(self.total))}}/{self.total}[/]" if self.total > 1 else ""
+
+    def _refresh(self) -> None:
         if self.overall is not None:
-            self.p.update(self.overall, completed=min(self.total, self.done_n + frac),
+            extra = sum(l._frac for l in self.lanes)
+            self.p.update(self.overall, completed=min(self.total, self.done_n + extra),
                           description=f"[bold]Overall[/]  {self.done_n}/{self.total} files")
+
+    def _print(self, text: str) -> None:
+        with self._lock:
+            self.p.console.print(text)
+
+    def _once(self, key: str, text: str) -> None:
+        with self._lock:
+            fresh = key not in self._seen
+            if fresh:
+                self._seen.add(key)
+        if fresh:
+            self._print(text)
+
+    def _advance(self) -> None:
+        with self._lock:
+            self.done_n += 1
+        self._refresh()
+
+
+class Lane:
+    """One live bar for whichever file this worker currently has. Passed into the compress/convert/burn/
+    download functions exactly like the old single UI object: begin/stage/tick/note/once/tag/done/fail/name.
+    A lane is only ever touched by the one thread that owns it, so none of its own state needs a lock."""
+
+    def __init__(self, batch: UI, task):
+        self.batch, self.task = batch, task
+        self.name, self.prefix, self.tags, self._frac = "", "", [], 0.0
 
     def begin(self, i: int, name: str) -> None:
         self.name = escape(name if len(name) <= 46 else name[:43] + "...")
-        self.prefix = f"{i}/{self.total}  " if self.total > 1 else ""
-        self.tags = []
+        self.prefix = f"{i}/{self.batch.total}  " if self.batch.total > 1 else ""
+        self.tags, self._frac = [], 0.0
         self.stage("starting")
 
     def stage(self, text: str) -> None:
-        self.p.update(self.cur, description=f"{self.prefix}{self.name}  [dim]{text}[/]", completed=0)
+        self.batch.p.update(self.task, description=f"{self.prefix}{self.name}  [dim]{text}[/]", completed=0)
 
     def tick(self, frac: float) -> None:
-        frac = max(0.0, min(1.0, frac))
-        self.p.update(self.cur, completed=frac * 100)
-        self._refresh(frac)
+        self._frac = max(0.0, min(1.0, frac))
+        self.batch.p.update(self.task, completed=self._frac * 100)
+        self.batch._refresh()
 
     def note(self, text: str) -> None:
-        self.p.console.print(text)
+        self.batch._print(text)
 
     def once(self, key: str, text: str) -> None:
-        if key not in self._seen:
-            self._seen.add(key)
-            self.p.console.print(text)
+        self.batch._once(key, text)
 
     def tag(self, text: str) -> None:
         if text and text not in self.tags:
             self.tags.append(text)
-
-    def _num(self, i: int) -> str:
-        return f"[dim]{i:>{len(str(self.total))}}/{self.total}[/]" if self.total > 1 else ""
 
     def done(self, i: int, name: str, dst: Path | None, secs: float, src_size: int | None = None) -> None:
         size = f"  {fmt_bytes(dst.stat().st_size):>10}" if dst and dst.exists() else ""
         if size and src_size:
             size = f"  [dim]{fmt_bytes(src_size):>10} \u2192[/]{size[1:]}"
         tags = f"  [dim]({', '.join(self.tags)})[/]" if self.tags else ""
-        lead = f"{self._num(i)}  " if self.total > 1 else ""
-        self.p.console.print(f"[green]\u2713[/] {lead}{escape(name)}  [green]done in {fmt_secs(secs)}[/]{size}{tags}")
-        self.done_n += 1
-        self._refresh()
+        lead = f"{self.batch._num(i)}  " if self.batch.total > 1 else ""
+        self.batch._print(f"[green]\u2713[/] {lead}{escape(name)}  [green]done in {fmt_secs(secs)}[/]{size}{tags}")
+        self._frac = 0.0
+        self.batch._advance()
 
     def fail(self, i: int, name: str, reason: str, secs: float) -> None:
         first = reason.strip().splitlines()[-1] if reason.strip() else "failed"
-        lead = f"{self._num(i)}  " if self.total > 1 else ""
-        self.p.console.print(f"[red]\u2717[/] {lead}{escape(name)}  [red]failed after {fmt_secs(secs)}[/]\n"
-                             f"      {escape(first[:200])}")
-        self.done_n += 1
-        self._refresh()
+        lead = f"{self.batch._num(i)}  " if self.batch.total > 1 else ""
+        self.batch._print(f"[red]\u2717[/] {lead}{escape(name)}  [red]failed after {fmt_secs(secs)}[/]\n"
+                          f"      {escape(first[:200])}")
+        self._frac = 0.0
+        self.batch._advance()
 
 
 def choose_items(labels: list, noun: str) -> list:
-    """For bulk jobs: process everything or pick specific items. Returns the chosen indexes in order."""
+    """For bulk jobs: process everything or pick specific items. Returns the chosen indexes in order.
+    On the pick list: Space selects, Shift+Up/Down drag-selects a range, Escape goes back to this question."""
     n = len(labels)
     if n < 2:
         return list(range(n))
-    mode = ask(qselect(f"Process all {n} {noun}, or choose specific ones?", choices=[
-        questionary.Choice(f"All {n} {noun}", "all"),
-        questionary.Choice("Choose specific ones", "pick"),
-    ]))
-    if mode == "all":
-        return list(range(n))
     while True:
-        picked = ask(qcheckbox("Select with Space, a = toggle all, i = invert, Enter = confirm",
-                               choices=[questionary.Choice(lbl, i) for i, lbl in enumerate(labels)]))
-        if picked:
-            return sorted(picked)
-        console.print("[yellow]Nothing selected, pick at least one[/yellow]")
+        mode = ask(qselect(f"Process all {n} {noun}, or choose specific ones?", choices=[
+            questionary.Choice(f"All {n} {noun}", "all"),
+            questionary.Choice("Choose specific ones", "pick"),
+        ]))
+        if mode == "all":
+            return list(range(n))
+        while True:
+            picked = qcheckbox_range("Pick which ones", labels)
+            if picked is BACK:
+                break                 # back to "all or pick"
+            if picked:
+                return picked
+            console.print("[yellow]Nothing selected, pick at least one[/yellow]")
+
+
+# With parallel jobs, several ffmpeg processes can be in flight from different threads at once, so Ctrl+C
+# cannot rely on a single local `proc` the way one-job-at-a-time code could: the main thread's
+# KeyboardInterrupt only unwinds its own stack. kill_active() lets it reach every running ffmpeg immediately.
+_ACTIVE_PROCS: set = set()
+_ACTIVE_LOCK = threading.Lock()
+
+
+def kill_active() -> None:
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE_PROCS)
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.kill()
+        except OSError:
+            pass
 
 
 def run_ffmpeg(args: list, ui: UI | None = None, duration: float | None = None, cwd=None) -> None:
@@ -481,6 +705,8 @@ def run_ffmpeg(args: list, ui: UI | None = None, duration: float | None = None, 
     with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, cwd=cwd,
                                 text=True, encoding="utf-8", errors="replace")
+        with _ACTIVE_LOCK:
+            _ACTIVE_PROCS.add(proc)
         try:
             for line in proc.stdout:
                 if ui and duration and line.startswith("out_time_us="):
@@ -492,6 +718,8 @@ def run_ffmpeg(args: list, ui: UI | None = None, duration: float | None = None, 
             if proc.poll() is None:          # Ctrl+C etc. → don't leave ffmpeg running
                 proc.kill()
                 proc.wait()
+            with _ACTIVE_LOCK:
+                _ACTIVE_PROCS.discard(proc)
         if rc != 0:
             err.seek(0)
             raise FFmpegError(err.read().strip()[-800:] or f"ffmpeg exited with code {rc}")
@@ -501,7 +729,7 @@ def run_ffmpeg(args: list, ui: UI | None = None, duration: float | None = None, 
 # VIDEO
 # ──────────────────────────────────────────────────────────────────────────────
 
-def video_enc_args(family: str, vcodec: str, level: str, kbps: int) -> list:
+def video_enc_args(family: str, vcodec: str, level: str, kbps: int, threads: int | None = None) -> list:
     i = COMPRESSION_LEVELS.index(level)
     a = ["-c:v", vcodec, "-b:v", f"{kbps}k", "-pix_fmt", "yuv420p"]
     if family == "x264":
@@ -512,12 +740,14 @@ def video_enc_args(family: str, vcodec: str, level: str, kbps: int) -> list:
         a += ["-deadline", "good", "-cpu-used", str((5, 3, 2, 1)[i]), "-row-mt", "1"]
     else:  # svtav1
         a += ["-preset", str((12, 8, 5, 2)[i])]
+    if threads:      # capped when several encodes run at once, so they share the CPU instead of fighting for it
+        a += ["-threads", str(threads)]
     return a
 
 
 def compress_video(inp: Path, dst_dir: Path, stem: str, target_mib: int, level: str, fmt: dict,
                    info: dict, saturation: float, use_2pass: bool, use_gpu: bool, fps_mode, ui: UI,
-                   burn: dict | None = None) -> Path:
+                   burn: dict | None = None, threads: int | None = None) -> Path:
     v = video_stream(info)
     if v is None:
         raise RuntimeError("No video stream in this file")
@@ -590,7 +820,7 @@ def compress_video(inp: Path, dst_dir: Path, stem: str, target_mib: int, level: 
             if two_pass and (not stats_ready or family == "svtav1"):
                 ui.stage(f"{tag} · pass 1/2")
                 try:
-                    run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps),
+                    run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps, threads),
                                 "-pass", "1", "-passlogfile", log, "-an", "-f", "null", NULL_DEVICE],
                                ui, duration, cwd=td)
                     stats_ready = True
@@ -600,12 +830,12 @@ def compress_video(inp: Path, dst_dir: Path, stem: str, target_mib: int, level: 
 
             if two_pass:
                 ui.stage(f"{tag} · pass 2/2 · {kbps} kbps")
-                run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps),
+                run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps, threads),
                             "-pass", "2", "-passlogfile", log, *audio_args, *mux_args, out_try],
                            ui, duration, cwd=td)
             else:
                 ui.stage(f"{tag} · {kbps} kbps")
-                run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps),
+                run_ffmpeg([*src, *vf_args, *video_enc_args(family, vcodec, level, kbps, threads),
                             *audio_args, *mux_args, out_try], ui, duration, cwd=td)
 
             size = out_try.stat().st_size
@@ -828,21 +1058,49 @@ def convert_lossless(inp: Path, dst_dir: Path, stem: str, info: dict, container:
 
 
 def ask_convert_options(config: dict) -> dict:
-    container = ask(qselect("Convert to", choices=[
-        questionary.Choice("MP4  -  plays almost everywhere", "mp4"),
-        questionary.Choice("MKV  -  keeps every stream exactly as recorded", "mkv"),
-    ], default=config.get("convert_container", "mp4")))
-    audio = "keep"
-    if container == "mp4":
-        audio = ask(qselect("Audio", choices=[
-            questionary.Choice("Keep original audio (lossless)", "keep"),
-            questionary.Choice("Convert to AAC 256 kbps (plays on more devices, tiny quality change)", "aac"),
-        ], default=config.get("convert_audio", "keep")))
-    verify = ask(qconfirm("Verify each file is identical to the original? (decodes both, slower)",
-                                     default=bool(config.get("verify", True))))
-    config.update({"convert_container": container, "convert_audio": audio, "verify": verify})
+    """Container, audio handling and verification. Any question can go back to the previous one."""
+    YES_NO = [("Yes", True), ("No", False)]
+    STAGES = ["container", "audio", "verify"]
+    ans: dict = {}
+    i, direction = 0, 1
+    while 0 <= i < len(STAGES):
+        stage = STAGES[i]
+        back_ok = i > 0
+
+        if stage == "container":
+            val = qselect_back("Convert to", [
+                questionary.Choice("MP4  -  plays almost everywhere", "mp4"),
+                questionary.Choice("MKV  -  keeps every stream exactly as recorded", "mkv"),
+            ], back_ok=back_ok, default=ans.get("container", config.get("convert_container", "mp4")))
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            ans["container"] = val
+
+        elif stage == "audio":
+            if ans["container"] != "mp4":
+                ans["audio"] = "keep"
+                i += direction; continue
+            val = qselect_back("Audio", [
+                questionary.Choice("Keep original audio (lossless)", "keep"),
+                questionary.Choice("Convert to AAC 256 kbps (plays on more devices, tiny quality change)", "aac"),
+            ], back_ok=back_ok, default=ans.get("audio", config.get("convert_audio", "keep")))
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            ans["audio"] = val
+
+        else:  # verify
+            val = qselect_back("Verify each file is identical to the original? (decodes both, slower)", YES_NO,
+                               back_ok=back_ok, default=ans.get("verify", bool(config.get("verify", True))))
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            ans["verify"] = val
+
+        direction = 1
+        i += 1
+
+    config.update({"convert_container": ans["container"], "convert_audio": ans["audio"], "verify": ans["verify"]})
     save_config(config)
-    return {"container": container, "audio": audio, "verify": verify}
+    return {"container": ans["container"], "audio": ans["audio"], "verify": ans["verify"]}
 
 
 def convert_one(path: Path, dest: Path, c: dict, info: dict, ui: UI) -> Path:
@@ -1182,21 +1440,46 @@ def _valid_stamp(t: str) -> bool:
 
 
 def ask_burn_quality(config: dict) -> dict:
-    crf = ask(qselect("Quality", choices=[questionary.Choice(t, v) for t, v in BURN_QUALITY],
-                                 default=config.get("burn_crf", 18)))
-    preset = ask(qselect("Encoding speed", choices=[questionary.Choice(t, v) for t, v in BURN_SPEEDS],
-                                    default=config.get("burn_preset", "medium")))
-    audio = ask(qselect("Audio", choices=[
-        questionary.Choice("Keep original audio", "keep"),
-        questionary.Choice("Convert to AAC 256 kbps (plays on more devices)", "aac")],
-        default=config.get("convert_audio", "keep")))
-    config.update({"burn_crf": crf, "burn_preset": preset, "convert_audio": audio})
+    """Quality, encode speed and audio handling for the high-quality burn-in. Any question can go back."""
+    STAGES = ["crf", "preset", "audio"]
+    ans: dict = {}
+    i = 0
+    while 0 <= i < len(STAGES):
+        stage = STAGES[i]
+        back_ok = i > 0
+
+        if stage == "crf":
+            val = qselect_back("Quality", BURN_QUALITY, back_ok=back_ok,
+                               default=ans.get("crf", config.get("burn_crf", 18)))
+            if val is BACK:
+                i -= 1; continue
+            ans["crf"] = val
+
+        elif stage == "preset":
+            val = qselect_back("Encoding speed", BURN_SPEEDS, back_ok=back_ok,
+                               default=ans.get("preset", config.get("burn_preset", "medium")))
+            if val is BACK:
+                i -= 1; continue
+            ans["preset"] = val
+
+        else:  # audio
+            val = qselect_back("Audio", [
+                questionary.Choice("Keep original audio", "keep"),
+                questionary.Choice("Convert to AAC 256 kbps (plays on more devices)", "aac")],
+                back_ok=back_ok, default=ans.get("audio", config.get("convert_audio", "keep")))
+            if val is BACK:
+                i -= 1; continue
+            ans["audio"] = val
+
+        i += 1
+
+    config.update({"burn_crf": ans["crf"], "burn_preset": ans["preset"], "convert_audio": ans["audio"]})
     save_config(config)
-    return {"crf": crf, "preset": preset, "audio": audio}
+    return {"crf": ans["crf"], "preset": ans["preset"], "audio": ans["audio"]}
 
 
 def burn_quality(inp: Path, dst_dir: Path, stem: str, info: dict, burn: dict, crf: int, preset: str,
-                 audio_mode: str, ui: UI) -> Path:
+                 audio_mode: str, ui: UI, threads: int | None = None) -> Path:
     """Re-encode to H.264 MP4 with the date burned in, keeping resolution, frame rate and all audio."""
     v = video_stream(info)
     if v is None:
@@ -1225,6 +1508,7 @@ def burn_quality(inp: Path, dst_dir: Path, stem: str, info: dict, burn: dict, cr
         ui.stage("encoding")
         run_ffmpeg(["-i", str(inp), *video_graph_args(pre, burn, [], w, h), "-map", "0:a?", "-dn",
                     "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
+                    *(["-threads", str(threads)] if threads else []),
                     *a_args, "-movflags", "+faststart", *creation_meta(info, st), out_try],
                    ui, duration, cwd=td)
         dst = unique_path(dst_dir, stem, ".mp4")
@@ -1461,33 +1745,58 @@ def youtube_flow(link: dict) -> dict | None:
         heights = sorted({r for f in info.get("formats", []) if f.get("vcodec") not in (None, "none")
                           for r in [_res(f)] if r})
 
-    # ── questions ────────────────────────────────────────────────────────────
-    mode = ask(qselect("Download as", choices=[
-        questionary.Choice("Video (with audio)", "video"),
-        questionary.Choice("Audio only", "audio"),
-    ]))
-    audio_only = mode == "audio"
-    height = abr = 0            # 0 means "best available" (questionary turns a None value into the title text)
+    # ── questions (mode -> quality -> compress, any of them can go back to the previous one) ──────────────
+    best = max(heights) if heights else None
+    caps = [h for h in VIDEO_HEIGHTS if best is None or h < best]
+    best_txt = f"Best available ({best}p)" if best else "Best available"
+    suffix = "" if len(entries) == 1 else "  (per video, lower if it has less)"
 
-    if audio_only:
-        abr = ask(qselect("Audio quality", choices=[
-            questionary.Choice("Best available", 0),
-            questionary.Choice("Standard (up to 128 kbps)", 128),
-            questionary.Choice("Small (up to 64 kbps)", 64),
-        ]))
-    else:
-        best = max(heights) if heights else None
-        caps = [h for h in VIDEO_HEIGHTS if best is None or h < best]
-        best_txt = f"Best available ({best}p)" if best else "Best available"
-        suffix = "" if len(entries) == 1 else "  (per video, lower if it has less)"
-        height = ask(qselect("Video quality", choices=[
-            questionary.Choice(best_txt + suffix, 0),
-            *[questionary.Choice(f"{h}p" + suffix, h) for h in caps],
-        ]))
+    STAGES = ["mode", "quality", "compress"]
+    ans: dict = {}
+    i = 0
+    while 0 <= i < len(STAGES):
+        stage = STAGES[i]
+        back_ok = i > 0
 
-    compress = ask(qconfirm("Compress it after downloading?", default=True))
-    return {"entries": entries, "folder": folder, "audio_only": audio_only,
-            "height": height, "abr": abr, "compress": compress}
+        if stage == "mode":
+            val = qselect_back("Download as", [
+                questionary.Choice("Video (with audio)", "video"),
+                questionary.Choice("Audio only", "audio"),
+            ], back_ok=back_ok, default=ans.get("mode"))
+            if val is BACK:
+                i -= 1; continue
+            ans["mode"] = val
+
+        elif stage == "quality":
+            if ans["mode"] == "audio":
+                val = qselect_back("Audio quality", [
+                    questionary.Choice("Best available", 0),
+                    questionary.Choice("Standard (up to 128 kbps)", 128),
+                    questionary.Choice("Small (up to 64 kbps)", 64),
+                ], back_ok=back_ok, default=ans.get("abr", 0))
+                if val is BACK:
+                    i -= 1; continue
+                ans["abr"], ans["height"] = val, 0
+            else:
+                val = qselect_back("Video quality", [
+                    questionary.Choice(best_txt + suffix, 0),
+                    *[questionary.Choice(f"{h}p" + suffix, h) for h in caps],
+                ], back_ok=back_ok, default=ans.get("height", 0))
+                if val is BACK:
+                    i -= 1; continue
+                ans["height"], ans["abr"] = val, 0
+
+        else:  # compress
+            val = qselect_back("Compress it after downloading?", [("Yes", True), ("No", False)],
+                               back_ok=back_ok, default=ans.get("compress", True))
+            if val is BACK:
+                i -= 1; continue
+            ans["compress"] = val
+
+        i += 1
+
+    return {"entries": entries, "folder": folder, "audio_only": ans["mode"] == "audio",
+            "height": ans["height"], "abr": ans["abr"], "compress": ans["compress"]}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1500,62 +1809,121 @@ def allowed_formats(kind: str, has_audio: bool) -> list:
 
 
 def ask_options(kind: str, has_audio: bool, config: dict) -> dict:
+    """Target size, format, level and (for video/image) encoder/frame-rate/saturation questions.
+    Any question can go back to the previous one (type b, or pick << Back) instead of restarting."""
     size_choices = [
         questionary.Choice("1 MiB", 1),
         questionary.Choice("8 MiB", 8),
-        questionary.Choice("10 MiB   ← most popular for short clips", 10),
+        questionary.Choice("10 MiB   \u2190 most popular for short clips", 10),
         questionary.Choice("20 MiB", 20),
         questionary.Choice("25 MiB", 25),
-        questionary.Choice("50 MiB   ← good balance", 50),
-        questionary.Choice("100 MiB  ← high quality longer content", 100),
+        questionary.Choice("50 MiB   \u2190 good balance", 50),
+        questionary.Choice("100 MiB  \u2190 high quality longer content", 100),
         questionary.Choice("500 MiB", 500),
         questionary.Choice("Custom...", "custom"),
     ]
-    target_mib = ask(qselect("Target size (MiB)", choices=size_choices))
-    if target_mib == "custom":
-        target_mib = int(ask(qtext(
-            "Custom size (MiB)", default="10",
-            validate=lambda t: (t.isdigit() and int(t) > 0) or "Enter a whole number above 0")))
+    YES_NO = [("Yes", True), ("No", False)]
+    STAGES = ["size", "format", "level", "gpu", "two_pass", "fps", "saturation"]
+    ans: dict = {}
+    i, direction = 0, 1
+    while 0 <= i < len(STAGES):
+        stage = STAGES[i]
+        back_ok = i > 0
 
-    fmts = allowed_formats(kind, has_audio)
-    fmt = ask(qselect(
-        "Output format", choices=[questionary.Choice(f"{f['name']}  •  {f['group']}", f) for f in fmts]))
-    level = ask(qselect("Compression level (speed ↔ quality)", choices=COMPRESSION_LEVELS))
+        if stage == "size":
+            val = qselect_back("Target size (MiB)", size_choices, back_ok=back_ok)
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            if val == "custom":
+                raw = qtext_back("Custom size (MiB)", default="10",
+                                 validate=lambda t: (t.isdigit() and int(t) > 0) or "Enter a whole number above 0",
+                                 back_ok=True)
+                if raw is BACK:
+                    continue                      # re-show the size menu, not a stage further back
+                val = int(raw)
+            ans["target_mib"] = val
 
-    use_gpu = use_2pass = False
-    fps = "original"
-    saturation = 100.0
+        elif stage == "format":
+            fmts = allowed_formats(kind, has_audio)
+            val = qselect_back("Output format",
+                               [questionary.Choice(f"{f['name']}  \u2022  {f['group']}", f) for f in fmts],
+                               back_ok=back_ok)
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            ans["fmt"] = val
 
-    if fmt["kind"] == "video":
-        if fmt["name"] == "MP4" and nvenc_works():
-            use_gpu = ask(qconfirm("GPU (NVENC) encoding?", default=bool(config.get("gpu", False))))
-            config["gpu"] = use_gpu
-        if use_gpu:
-            console.print("[dim]GPU encoding is single-pass[/dim]")
-        else:
-            use_2pass = ask(qconfirm("2-pass encoding? (slower, more accurate size)",
-                                                default=bool(config.get("two_pass", True))))
-            config["two_pass"] = use_2pass
-        save_config(config)
+        elif stage == "level":
+            val = qselect_back("Compression level (speed \u2194 quality)", COMPRESSION_LEVELS, back_ok=back_ok,
+                               default=ans.get("level"))
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            ans["level"] = val
 
-        fps = ask(qselect("Frame rate", choices=[questionary.Choice(t, v) for t, v in FPS_CHOICES]))
+        elif stage == "gpu":
+            fmt = ans["fmt"]
+            if not (fmt["kind"] == "video" and fmt["name"] == "MP4" and nvenc_works()):
+                ans["use_gpu"] = False
+                i += direction; continue
+            val = qselect_back("GPU (NVENC) encoding?", YES_NO, back_ok=back_ok,
+                               default=ans.get("use_gpu", bool(config.get("gpu", False))))
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            ans["use_gpu"] = val
+            config["gpu"] = val
+            if val:
+                console.print("[dim]GPU encoding is single-pass[/dim]")
 
-    if fmt["kind"] in ("video", "image"):
-        raw_sat = ask(qtext("Saturation multiplier (%) - press Enter for 100%", default="100")).strip()
-        try:
-            saturation = max(0.0, min(200.0, float(raw_sat)))
-        except ValueError:
-            console.print("[yellow]Invalid value → using 100%[/yellow]")
+        elif stage == "two_pass":
+            fmt = ans["fmt"]
+            if fmt["kind"] != "video" or ans.get("use_gpu"):
+                ans["use_2pass"] = False
+                i += direction; continue
+            val = qselect_back("2-pass encoding? (slower, more accurate size)", YES_NO, back_ok=back_ok,
+                               default=ans.get("use_2pass", bool(config.get("two_pass", True))))
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            ans["use_2pass"] = val
+            config["two_pass"] = val
 
-    return {"target_mib": target_mib, "fmt": fmt, "level": level,
-            "use_gpu": use_gpu, "use_2pass": use_2pass, "fps": fps, "saturation": saturation}
+        elif stage == "fps":
+            fmt = ans["fmt"]
+            if fmt["kind"] != "video":
+                ans["fps"] = "original"
+                i += direction; continue
+            val = qselect_back("Frame rate", FPS_CHOICES, back_ok=back_ok, default=ans.get("fps"))
+            if val is BACK:
+                direction = -1; i -= 1; continue
+            ans["fps"] = val
+
+        else:  # saturation
+            fmt = ans["fmt"]
+            if fmt["kind"] not in ("video", "image"):
+                ans["saturation"] = 100.0
+                i += direction; continue
+            raw = qtext_back("Saturation multiplier (%)", default="100", back_ok=back_ok)
+            if raw is BACK:
+                direction = -1; i -= 1; continue
+            try:
+                ans["saturation"] = max(0.0, min(200.0, float(raw)))
+            except ValueError:
+                console.print("[yellow]Invalid value \u2192 using 100%[/yellow]")
+                ans["saturation"] = 100.0
+
+        direction = 1
+        i += 1
+
+    save_config(config)
+    return {"target_mib": ans["target_mib"], "fmt": ans["fmt"], "level": ans["level"],
+            "use_gpu": ans["use_gpu"], "use_2pass": ans["use_2pass"], "fps": ans["fps"],
+            "saturation": ans["saturation"]}
 
 
-def compress_one(path: Path, dest: Path, o: dict, info: dict, ui: UI, burn: dict | None = None) -> Path:
+def compress_one(path: Path, dest: Path, o: dict, info: dict, ui: UI, burn: dict | None = None,
+                 threads: int | None = None) -> Path:
     fmt, stem = o["fmt"], path.stem + "_compressed"
     if fmt["kind"] == "video":
         return compress_video(path, dest, stem, o["target_mib"], o["level"], fmt, info,
-                              o["saturation"], o["use_2pass"], o["use_gpu"], o["fps"], ui, burn=burn)
+                              o["saturation"], o["use_2pass"], o["use_gpu"], o["fps"], ui, burn=burn, threads=threads)
     if fmt["kind"] == "audio":
         return compress_audio(path, dest, stem, o["target_mib"], o["level"], fmt, info, ui)
     return compress_image(path, dest, stem, o["target_mib"], o["level"], fmt, info, o["saturation"], ui)
@@ -1654,6 +2022,40 @@ def _label_clip(f: Path, clips: dict, root: Path | None) -> str:
     when = f"{c['first']:%d-%m-%Y %H:%M:%S}" if c and c["first"] else "no date"
     dur = fmt_duration(c["duration"]) if c else ""
     return f"{f.name:<12} {when:<19} {dur:>7}  {fmt_bytes(f.stat().st_size):>10}"
+
+
+def ask_parallel(n: int, job: str, plan: dict | None, config: dict) -> int:
+    """How many files to process at once in a batch of n. Returns 1 for the plain one-at-a-time behavior."""
+    if n < 2:
+        return 1
+    cpus = cpu_count()
+    if plan:                      # downloads: limited by bandwidth, not CPU; keep it modest either way
+        suggested = min(4, n)
+    elif job == "convert":        # lossless: a stream copy barely touches the CPU, so this scales further
+        suggested = min(8, cpus, n)
+    else:                         # compress / burn in date: a real re-encode per file, don't oversubscribe the CPU
+        suggested = min(4, max(1, cpus // 2), n)
+    if suggested < 2:
+        return 1
+    noun = "downloads" if plan else "files"
+    saved = config.get("parallel", 1)
+    choices = [questionary.Choice("One at a time", 1),
+              questionary.Choice(f"{suggested} at a time  (suggested for this computer)", suggested)]
+    if saved not in (1, suggested) and saved <= n:
+        choices.append(questionary.Choice(f"{saved} at a time  (last used)", saved))
+    choices.append(questionary.Choice("Custom...", "custom"))
+    workers = ask(qselect(f"Process how many {noun} at once?", choices=choices,
+                          default=saved if saved in (1, suggested) else 1))
+    if workers == "custom":
+        cap = min(n, 16)
+        workers = int(ask(qtext(f"How many at once? (1-{cap})", default=str(min(suggested, cap)),
+                                validate=lambda t: (t.isdigit() and 1 <= int(t) <= cap) or f"Enter 1-{cap}")))
+    workers = max(1, min(workers, n))
+    config["parallel"] = workers
+    save_config(config)
+    if workers > 1:
+        kv("Parallel", f"{workers} at a time")
+    return workers
 
 
 def run_job(config: dict) -> None:
@@ -1827,6 +2229,9 @@ def run_job(config: dict) -> None:
 
     # ── 3  Processing ────────────────────────────────────────────────────────
     items = plan["entries"] if plan else [{"url": None, "path": f, "title": f.name} for f in local]
+    workers = ask_parallel(len(items), job, plan, config)
+    enc_threads = ffmpeg_threads(workers) if workers > 1 else None
+
     section("3  Processing")
     if plan:
         what = "audio only" if plan["audio_only"] else (f"video up to {plan['height']}p" if plan["height"] else "video, best quality")
@@ -1847,6 +2252,7 @@ def run_job(config: dict) -> None:
     console.print()
 
     results, failures = [], []
+    results_lock = threading.Lock()
     tmp_root = Path(tempfile.mkdtemp(dir=dest, prefix=".tmp_download_")) if plan and opts else None
     t0 = time.perf_counter()
     progress = Progress(
@@ -1854,44 +2260,81 @@ def run_job(config: dict) -> None:
         TextColumn("{task.description}", table_column=Column(no_wrap=True, overflow="ellipsis", ratio=1)),
         BarColumn(bar_width=26), TaskProgressColumn(), TimeElapsedColumn(), TimeRemainingColumn(),
         console=console, transient=True, expand=True)
+
+    def process_item(i: int, item: dict, lane: "Lane") -> None:
+        lane.begin(i, item["title"])
+        t_file = time.perf_counter()
+        dst = src_size = None
+        try:
+            if plan:
+                prefix = f"{i:02d} - " if len(items) > 1 else ""
+                path = download_one(item["url"], tmp_root or dest, prefix, plan, lane, lane.name)
+                if opts is None:
+                    dst = path
+                else:
+                    src_size = path.stat().st_size
+                    file_info = get_media_info(path)
+            else:
+                path = item["path"]
+                src_size = path.stat().st_size
+                file_info = infos.get(path) or (info if len(local) == 1 and info else get_media_info(path))
+            if dst is None:
+                if job == "convert":
+                    dst = convert_one(path, dest, copts, file_info, lane)
+                elif job == "burn_hq":
+                    dst = burn_quality(path, dest, path.stem + "_datecode", file_info, burn_map[path],
+                                       bq["crf"], bq["preset"], bq["audio"], lane, threads=enc_threads)
+                else:
+                    dst = compress_one(path, dest, opts, file_info, lane, burn_map.get(path), threads=enc_threads)
+                if plan:
+                    path.unlink(missing_ok=True)       # keep only the compressed copy
+            with results_lock:
+                results.append(dst)
+            lane.done(i, item["title"], dst, time.perf_counter() - t_file, src_size)
+        except subprocess.CalledProcessError:
+            with results_lock:
+                failures.append(item["title"])
+            lane.fail(i, item["title"], "Can't read this file (corrupt or not a video)", time.perf_counter() - t_file)
+        except (RuntimeError, OSError, ValueError) as e:
+            with results_lock:
+                failures.append(item["title"])
+            lane.fail(i, item["title"], str(e), time.perf_counter() - t_file)
+
     try:
         with progress:
-            ui = UI(progress, len(items))
-            for i, item in enumerate(items, 1):
-                ui.begin(i, item["title"])
-                t_file = time.perf_counter()
-                dst = src_size = None
+            ui = UI(progress, len(items), workers=workers)
+            if workers <= 1:
+                lane = ui.lane()
+                for i, item in enumerate(items, 1):
+                    process_item(i, item, lane)
+            else:
+                work = queue.Queue()
+                for i, item in enumerate(items, 1):
+                    work.put((i, item))
+                cancel = threading.Event()      # set on Ctrl+C: stop pulling new items once the current one ends
+
+                def run_lane(n: int) -> None:
+                    lane = ui.lane(n)
+                    while not cancel.is_set():
+                        try:
+                            i, item = work.get_nowait()
+                        except queue.Empty:
+                            return
+                        process_item(i, item, lane)
+                        work.task_done()
+
+                lane_threads = [threading.Thread(target=run_lane, args=(w,), daemon=True) for w in range(workers)]
+                for t in lane_threads:
+                    t.start()
                 try:
-                    if plan:
-                        prefix = f"{i:02d} - " if len(items) > 1 else ""
-                        path = download_one(item["url"], tmp_root or dest, prefix, plan, ui, ui.name)
-                        if opts is None:
-                            dst = path
-                        else:
-                            src_size = path.stat().st_size
-                            file_info = get_media_info(path)
-                    else:
-                        path = item["path"]
-                        src_size = path.stat().st_size
-                        file_info = infos.get(path) or (info if len(local) == 1 and info else get_media_info(path))
-                    if dst is None:
-                        if job == "convert":
-                            dst = convert_one(path, dest, copts, file_info, ui)
-                        elif job == "burn_hq":
-                            dst = burn_quality(path, dest, path.stem + "_datecode", file_info, burn_map[path],
-                                               bq["crf"], bq["preset"], bq["audio"], ui)
-                        else:
-                            dst = compress_one(path, dest, opts, file_info, ui, burn_map.get(path))
-                        if plan:
-                            path.unlink(missing_ok=True)       # keep only the compressed copy
-                    results.append(dst)
-                    ui.done(i, item["title"], dst, time.perf_counter() - t_file, src_size)
-                except subprocess.CalledProcessError:
-                    failures.append(item["title"])
-                    ui.fail(i, item["title"], "Can't read this file (corrupt or not a video)", time.perf_counter() - t_file)
-                except (RuntimeError, OSError, ValueError) as e:
-                    failures.append(item["title"])
-                    ui.fail(i, item["title"], str(e), time.perf_counter() - t_file)
+                    for t in lane_threads:
+                        t.join()
+                except KeyboardInterrupt:
+                    cancel.set()                # no more queued files are picked up
+                    kill_active()               # ...and whichever file each lane is mid-encode on is stopped too
+                    for t in lane_threads:
+                        t.join(timeout=5)
+                    raise
     finally:
         if tmp_root:
             shutil.rmtree(tmp_root, ignore_errors=True)

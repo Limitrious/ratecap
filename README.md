@@ -9,6 +9,9 @@ A simple, offline, FFmpeg-based tool with a console interface. Fit video, audio 
 * YouTube download: video or audio, quality choice, optional compress right after
 * Playlists: download all videos or pick specific ones
 * Bulk mode: drag in a folder or several files and process them all, or pick specific ones
+* Parallel processing: do several files at once on bulk jobs, with a CPU-aware suggestion
+* Any question can be undone: go back to the previous one instead of restarting the program
+* Range-select in pick lists: Shift+Up/Down selects everything the cursor passes over
 * Sony Handycam (AVCHD) support: lossless convert, compress, and burn in the recording date and time in the camera's own style
 * A compact technical summary of the file you drag in (codec, resolution, frame rate, bitrate, audio, size)
 * Optional 2-pass encoding (CPU only, higher accuracy)
@@ -88,6 +91,16 @@ The clips are read from `STREAM`. Anything else on the card (like `DCIM` photos)
 
 Press Enter with nothing typed at the first prompt to change the output folder.
 
+**Changed your mind partway through a question?** Most menus have a `<< Back` option at the bottom (or
+type `b`/`back` at a text prompt) that returns to the previous question instead of forcing you to Ctrl+C
+and start over. Going back only works within the current group of questions (for example size → format
+→ level → ... for a compress job); it can't reach back into an earlier section like re-picking the
+input file.
+
+**Picking specific files or clips from a list?** Space selects one, Shift+Up/Down drag-selects a range
+(like holding Shift and clicking in a file manager), `a` toggles everything, `i` inverts the selection,
+and Escape goes back to the "all or pick specific ones" question.
+
 ## Output folders
 
 Results are sorted by what was done to the file, inside one `output` folder next to the script. A folder is only created when it is used.
@@ -111,8 +124,26 @@ When the input is a folder or a YouTube playlist, the results go into a subfolde
 3. Choose the output format
 4. Choose the compression level
 5. For video: GPU encoding (NVENC, MP4 only, shown when available), 2-pass encoding, frame rate, saturation
+6. For a bulk job: how many files to process at once (see [Parallel processing](#parallel-processing))
 
 Output formats depend on the input. Video: MP4, WebM, AV1 MKV, or audio only (MP3, M4A, OGG). Audio: MP3, M4A, OGG. Images: PNG/JPEG (PNG if it fits, otherwise JPEG), WebP, AVIF. Video inputs include MTS / M2TS (AVCHD), MP4, MOV, MKV, AVI, MPG, WMV, WebM, 3GP, FLV and MXF.
+
+## Parallel processing
+
+For a bulk job (a folder, several dragged-in files, or a YouTube playlist), you're asked how many files
+to do at once instead of one at a time.
+
+* The suggested number depends on the job and this computer's CPU: lossless convert barely touches the
+  CPU so it scales furthest, a real re-encode (compress or burn in the date) is capped to avoid
+  oversubscribing the CPU, and YouTube downloads get a modest fixed suggestion since they're limited by
+  your connection rather than the CPU.
+* Each concurrent ffmpeg is given a share of the CPU's threads, so running several at once doesn't make
+  each one fight the others for the same cores.
+* Finished files are printed as they complete, in whatever order that happens to be, alongside an
+  overall bar with an ETA for the batch.
+* Ctrl+C stops the whole batch: it kills whichever file(s) are mid-encode and abandons anything still
+  queued, rather than quietly working through the rest.
+* Your choice is remembered as "last used" the next time a similar batch comes up.
 
 ## Convert without re-encoding
 
