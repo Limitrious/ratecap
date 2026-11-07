@@ -1808,9 +1808,11 @@ def allowed_formats(kind: str, has_audio: bool) -> list:
     return [f for f in FORMATS if f["kind"] in kinds]
 
 
-def ask_options(kind: str, has_audio: bool, config: dict) -> dict:
+def ask_options(kind: str, has_audio: bool, config: dict, can_back: bool = False) -> dict:
     """Target size, format, level and (for video/image) encoder/frame-rate/saturation questions.
-    Any question can go back to the previous one (type b, or pick << Back) instead of restarting."""
+    Any question can go back to the previous one (type b, or pick << Back) instead of restarting.
+    With can_back, going back out of the very first question (size) returns BACK instead of asking it,
+    so the caller can send the person back to whatever came before this group of questions."""
     size_choices = [
         questionary.Choice("1 MiB", 1),
         questionary.Choice("8 MiB", 8),
@@ -1826,9 +1828,11 @@ def ask_options(kind: str, has_audio: bool, config: dict) -> dict:
     STAGES = ["size", "format", "level", "gpu", "two_pass", "fps", "saturation"]
     ans: dict = {}
     i, direction = 0, 1
-    while 0 <= i < len(STAGES):
+    while i < len(STAGES):
+        if i < 0:
+            return BACK
         stage = STAGES[i]
-        back_ok = i > 0
+        back_ok = i > 0 or (i == 0 and can_back)
 
         if stage == "size":
             val = qselect_back("Target size (MiB)", size_choices, back_ok=back_ok)
@@ -2209,12 +2213,6 @@ def run_job(config: dict) -> None:
             questionary.Choice("Convert without re-encoding (lossless, e.g. camcorder MTS to MP4)", "convert"),
         ]))
 
-    dest = out_folder / output_category(job, plan, local)
-    sub = plan["folder"] if plan and plan["folder"] else folder_name      # playlist or input folder name
-    if sub:
-        dest = dest / sub
-    dest.mkdir(parents=True, exist_ok=True)
-
     opts = copts = None
     if job == "convert":
         copts = ask_convert_options(config)
@@ -2222,10 +2220,29 @@ def run_job(config: dict) -> None:
         bq = ask_burn_quality(config)
     elif plan is None or plan["compress"]:
         has_audio = True if (plan or root or len(local) > 1) else audio_stream(info) is not None
-        opts = ask_options(kind, has_audio, config)
-        if len(local) == 1 and local[0].stat().st_size <= opts["target_mib"] * 1_048_576:
+        while True:
+            opts = ask_options(kind, has_audio, config, can_back=bool(plan))
+            if opts is not BACK:
+                break
+            # back out of the YouTube quality/compress choice instead of restarting the whole program
+            plan = youtube_flow(link)
+            if plan is None:
+                return
+            kind = "audio" if plan["audio_only"] else "video"
+            has_audio = True
+            if not plan["compress"]:
+                opts = None
+                break
+        if opts and len(local) == 1 and local[0].stat().st_size <= opts["target_mib"] * 1_048_576:
             console.print(f"[yellow]Note: the input is already under {opts['target_mib']} MiB, "
                           f"re-encoding may not make it smaller[/yellow]")
+
+    # dest is computed here, not earlier, so it reflects job/plan as they stand after any "go back" above
+    dest = out_folder / output_category(job, plan, local)
+    sub = plan["folder"] if plan and plan["folder"] else folder_name      # playlist or input folder name
+    if sub:
+        dest = dest / sub
+    dest.mkdir(parents=True, exist_ok=True)
 
     # ── 3  Processing ────────────────────────────────────────────────────────
     items = plan["entries"] if plan else [{"url": None, "path": f, "title": f.name} for f in local]
