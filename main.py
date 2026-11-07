@@ -1669,6 +1669,73 @@ def download_one(url: str, dest_dir: Path, prefix: str, plan: dict, ui: UI, labe
     return Path(done)
 
 
+def ask_youtube_options(entries: list, heights: list, resume: dict | None = None, can_back: bool = False) -> dict:
+    """Download mode, quality and whether to compress afterward. Any question can go back to the one
+    before it. With `resume` (an earlier result of this same function), starts already answered and
+    lands straight on "Compress it after downloading?" instead of redoing mode/quality too \u2014 this is
+    what lets a LATER wizard (ask_options) send someone back here without redoing the playlist lookup
+    that sits before this in youtube_flow. With can_back, backing out of the very first question
+    (mode, or "compress" when resuming) returns BACK instead of asking it."""
+    best = max(heights) if heights else None
+    caps = [h for h in VIDEO_HEIGHTS if best is None or h < best]
+    best_txt = f"Best available ({best}p)" if best else "Best available"
+    suffix = "" if len(entries) == 1 else "  (per video, lower if it has less)"
+
+    STAGES = ["mode", "quality", "compress"]
+    ans: dict = {}
+    i = len(STAGES) - 1 if resume else 0
+    if resume:
+        ans["mode"] = "audio" if resume["audio_only"] else "video"
+        ans["height"], ans["abr"] = resume.get("height", 0), resume.get("abr", 0)
+        ans["compress"] = resume.get("compress", True)
+
+    while i < len(STAGES):
+        if i < 0:
+            return BACK
+        stage = STAGES[i]
+        back_ok = i > 0 or (i == 0 and can_back)
+
+        if stage == "mode":
+            val = qselect_back("Download as", [
+                questionary.Choice("Video (with audio)", "video"),
+                questionary.Choice("Audio only", "audio"),
+            ], back_ok=back_ok, default=ans.get("mode"))
+            if val is BACK:
+                i -= 1; continue
+            ans["mode"] = val
+
+        elif stage == "quality":
+            if ans["mode"] == "audio":
+                val = qselect_back("Audio quality", [
+                    questionary.Choice("Best available", 0),
+                    questionary.Choice("Standard (up to 128 kbps)", 128),
+                    questionary.Choice("Small (up to 64 kbps)", 64),
+                ], back_ok=back_ok, default=ans.get("abr", 0))
+                if val is BACK:
+                    i -= 1; continue
+                ans["abr"], ans["height"] = val, 0
+            else:
+                val = qselect_back("Video quality", [
+                    questionary.Choice(best_txt + suffix, 0),
+                    *[questionary.Choice(f"{h}p" + suffix, h) for h in caps],
+                ], back_ok=back_ok, default=ans.get("height", 0))
+                if val is BACK:
+                    i -= 1; continue
+                ans["height"], ans["abr"] = val, 0
+
+        else:  # compress
+            val = qselect_back("Compress it after downloading?", [("Yes", True), ("No", False)],
+                               back_ok=back_ok, default=ans.get("compress", True))
+            if val is BACK:
+                i -= 1; continue
+            ans["compress"] = val
+
+        i += 1
+
+    return {"audio_only": ans["mode"] == "audio", "height": ans["height"], "abr": ans["abr"],
+            "compress": ans["compress"]}
+
+
 def youtube_flow(link: dict) -> dict | None:
     """Ask everything about a YouTube link. Returns a plan, or None to go back to the input prompt."""
     if _ytdlp() is None:
@@ -1745,58 +1812,8 @@ def youtube_flow(link: dict) -> dict | None:
         heights = sorted({r for f in info.get("formats", []) if f.get("vcodec") not in (None, "none")
                           for r in [_res(f)] if r})
 
-    # ── questions (mode -> quality -> compress, any of them can go back to the previous one) ──────────────
-    best = max(heights) if heights else None
-    caps = [h for h in VIDEO_HEIGHTS if best is None or h < best]
-    best_txt = f"Best available ({best}p)" if best else "Best available"
-    suffix = "" if len(entries) == 1 else "  (per video, lower if it has less)"
-
-    STAGES = ["mode", "quality", "compress"]
-    ans: dict = {}
-    i = 0
-    while 0 <= i < len(STAGES):
-        stage = STAGES[i]
-        back_ok = i > 0
-
-        if stage == "mode":
-            val = qselect_back("Download as", [
-                questionary.Choice("Video (with audio)", "video"),
-                questionary.Choice("Audio only", "audio"),
-            ], back_ok=back_ok, default=ans.get("mode"))
-            if val is BACK:
-                i -= 1; continue
-            ans["mode"] = val
-
-        elif stage == "quality":
-            if ans["mode"] == "audio":
-                val = qselect_back("Audio quality", [
-                    questionary.Choice("Best available", 0),
-                    questionary.Choice("Standard (up to 128 kbps)", 128),
-                    questionary.Choice("Small (up to 64 kbps)", 64),
-                ], back_ok=back_ok, default=ans.get("abr", 0))
-                if val is BACK:
-                    i -= 1; continue
-                ans["abr"], ans["height"] = val, 0
-            else:
-                val = qselect_back("Video quality", [
-                    questionary.Choice(best_txt + suffix, 0),
-                    *[questionary.Choice(f"{h}p" + suffix, h) for h in caps],
-                ], back_ok=back_ok, default=ans.get("height", 0))
-                if val is BACK:
-                    i -= 1; continue
-                ans["height"], ans["abr"] = val, 0
-
-        else:  # compress
-            val = qselect_back("Compress it after downloading?", [("Yes", True), ("No", False)],
-                               back_ok=back_ok, default=ans.get("compress", True))
-            if val is BACK:
-                i -= 1; continue
-            ans["compress"] = val
-
-        i += 1
-
-    return {"entries": entries, "folder": folder, "audio_only": ans["mode"] == "audio",
-            "height": ans["height"], "abr": ans["abr"], "compress": ans["compress"]}
+    opts = ask_youtube_options(entries, heights)
+    return {"entries": entries, "folder": folder, "_heights": heights, **opts}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2224,10 +2241,14 @@ def run_job(config: dict) -> None:
             opts = ask_options(kind, has_audio, config, can_back=bool(plan))
             if opts is not BACK:
                 break
-            # back out of the YouTube quality/compress choice instead of restarting the whole program
-            plan = youtube_flow(link)
-            if plan is None:
-                return
+            # back out to this download's own quality/compress questions, not the whole playlist lookup
+            yt_opts = ask_youtube_options(plan["entries"], plan["_heights"], resume=plan, can_back=True)
+            if yt_opts is BACK:
+                plan = youtube_flow(link)      # backed past "Download as" too: there's nothing closer, start over
+                if plan is None:
+                    return
+            else:
+                plan.update(yt_opts)
             kind = "audio" if plan["audio_only"] else "video"
             has_audio = True
             if not plan["compress"]:
